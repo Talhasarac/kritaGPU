@@ -311,6 +311,7 @@ if (WIN32)
     endif()
     add_executable(krita_windows_stub_exe
         windows_stub_main.cpp
+        windows_gpu_preference.cpp
         ${krita_windows_stub_ICONS_SRCS}
         ${CMAKE_CURRENT_BINARY_DIR}/versioninfo.rc
         ${KRITA_MANIFEST_SRC}
@@ -321,9 +322,12 @@ if (WIN32)
     else()
         target_link_libraries(krita_windows_stub_exe PRIVATE Qt5::WinMain)
     endif()
+    # Exporting the GPU preference creates an import library for each stub.
+    # Keep these names distinct from the main krita.dll import library.
     set_target_properties(krita_windows_stub_exe
         PROPERTIES
             OUTPUT_NAME "krita"
+            ARCHIVE_OUTPUT_NAME "krita_stub_exe"
     )
     if (MSVC)
         target_link_options(krita_windows_stub_exe PRIVATE "/DEBUG:NONE")
@@ -332,6 +336,7 @@ if (WIN32)
 
     add_executable(krita_windows_stub_com
         windows_stub_main.cpp
+        windows_gpu_preference.cpp
         ${CMAKE_CURRENT_BINARY_DIR}/versioninfo.rc
         ${KRITA_MANIFEST_SRC}
     )
@@ -340,6 +345,7 @@ if (WIN32)
         PROPERTIES
             WIN32_EXECUTABLE false
             OUTPUT_NAME "krita"
+            ARCHIVE_OUTPUT_NAME "krita_stub_com"
             SUFFIX ".com"
     )
     if (MSVC)

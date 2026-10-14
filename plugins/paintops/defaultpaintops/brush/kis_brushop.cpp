@@ -42,6 +42,7 @@
 #include <QThread>
 #include "kis_image_config.h"
 #include "kis_wrapped_rect.h"
+#include "gpu/KisGpuBrushPaint.h"
 
 
 KisBrushOp::KisBrushOp(const KisPaintOpSettingsSP settings, KisPainter *painter, KisNodeSP node, KisImageSP image)
@@ -62,6 +63,7 @@ KisBrushOp::KisBrushOp(const KisPaintOpSettingsSP settings, KisPainter *painter,
     , m_idealNumRects(KisImageConfig(true).maxNumberOfThreads())
     , m_minUpdatePeriod(10)
     , m_maxUpdatePeriod(100)
+    , m_useGpuBrushCompositing(KisImageConfig(true).useGpuBrushCompositing())
 {
     Q_UNUSED(image);
     Q_ASSERT(settings);
@@ -154,6 +156,7 @@ struct KisBrushOp::UpdateSharedState
     // rendering data
     KisPainter *painter = 0;
     QList<KisRenderedDab> dabsQueue;
+    bool usedGpu = false;
 
     // speed metrics
     QVector<QPointF> dabPoints;
@@ -162,6 +165,28 @@ struct KisBrushOp::UpdateSharedState
     // final report
     QVector<QRect> allDirtyRects;
 };
+
+void KisBrushOp::addDabRenderingJobs(const QVector<QRect> &rects,
+                                    UpdateSharedStateSP state,
+                                    QVector<KisRunnableStrokeJobData*> &jobs)
+{
+    if (m_useGpuBrushCompositing &&
+        KisGpuBrushPaint::shouldUse(state->painter, rects, state->dabsQueue)) {
+        KritaUtils::addJobSequential(jobs, [rects, state] {
+            if (KisGpuBrushPaint::tryPaint(state->painter, rects, state->dabsQueue)) {
+                state->usedGpu = true;
+            } else {
+                for (const QRect &rect : rects) state->painter->bltFixed(rect, state->dabsQueue);
+            }
+        });
+    } else {
+        for (const QRect &rect : rects) {
+            KritaUtils::addJobConcurrent(jobs, [rect, state] {
+                state->painter->bltFixed(rect, state->dabsQueue);
+            });
+        }
+    }
+}
 
 void KisBrushOp::addMirroringJobs(Qt::Orientation direction,
                                   QVector<QRect> &rects,
@@ -193,13 +218,8 @@ void KisBrushOp::addMirroringJobs(Qt::Orientation direction,
 
     for (QRect &rc : rects) {
         state->painter->mirrorRect(direction, &rc);
-
-        KritaUtils::addJobConcurrent(jobs,
-            [rc, state] () {
-                state->painter->bltFixed(rc, state->dabsQueue);
-            }
-        );
     }
+    addDabRenderingJobs(rects, state, jobs);
 
     state->allDirtyRects.append(rects);
 }
@@ -294,13 +314,7 @@ std::pair<int, bool> KisBrushOp::doAsynchronousUpdate(QVector<KisRunnableStrokeJ
 
         state->dabRenderingTimer.start();
 
-        Q_FOREACH (const QRect &rc, rects) {
-            KritaUtils::addJobConcurrent(jobs,
-                [rc, state] () {
-                    state->painter->bltFixed(rc, state->dabsQueue);
-                }
-            );
-        }
+        addDabRenderingJobs(rects, state, jobs);
 
         /**
          * After the dab has been rendered once, we should mirror it either one
@@ -344,7 +358,9 @@ std::pair<int, bool> KisBrushOp::doAsynchronousUpdate(QVector<KisRunnableStrokeJ
                     const qreal totalRenderingTimePerDab = dabRenderingTime + currentUpdateTimePerDab;
 
                     const int approxDabRenderingTime =
-                        qreal(totalRenderingTimePerDab) * m_avgNumDabs.rollingMean() / m_idealNumRects;
+                        state->usedGpu
+                        ? dabRenderingTime * m_avgNumDabs.rollingMean() / m_idealNumRects + updateRenderingTime
+                        : qreal(totalRenderingTimePerDab) * m_avgNumDabs.rollingMean() / m_idealNumRects;
 
                     m_currentUpdatePeriod =
                         someDabsAreStillInQueue ? m_minUpdatePeriod :

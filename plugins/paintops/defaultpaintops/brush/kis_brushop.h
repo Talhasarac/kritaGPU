@@ -57,6 +57,10 @@ protected:
                           UpdateSharedStateSP state,
                           QVector<KisRunnableStrokeJobData*> &jobs);
 
+    void addDabRenderingJobs(const QVector<QRect> &rects,
+                             UpdateSharedStateSP state,
+                             QVector<KisRunnableStrokeJobData*> &jobs);
+
     UpdateSharedStateSP m_updateSharedState;
 
 
@@ -87,6 +91,7 @@ private:
 
     const int m_minUpdatePeriod;
     const int m_maxUpdatePeriod;
+    const bool m_useGpuBrushCompositing;
 };
 
 #endif // KIS_BRUSHOP_H_

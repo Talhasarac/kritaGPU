@@ -105,6 +105,9 @@ public:
     int maxNumberOfThreads(bool defaultValue = false) const;
     void setMaxNumberOfThreads(int value);
 
+    bool useGpuBrushCompositing(bool requestDefault = false) const;
+    void setUseGpuBrushCompositing(bool value);
+
     int frameRenderingClones(bool defaultValue = false) const;
     void setFrameRenderingClones(int value);
 

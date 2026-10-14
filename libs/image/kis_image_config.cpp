@@ -581,6 +581,21 @@ void KisImageConfig::setMaxNumberOfThreads(int value)
     }
 }
 
+bool KisImageConfig::useGpuBrushCompositing(bool requestDefault) const
+{
+#ifdef Q_OS_WIN
+    return requestDefault ? true : m_config.readEntry("useGpuBrushCompositing", true);
+#else
+    Q_UNUSED(requestDefault);
+    return false;
+#endif
+}
+
+void KisImageConfig::setUseGpuBrushCompositing(bool value)
+{
+    m_config.writeEntry("useGpuBrushCompositing", value);
+}
+
 int KisImageConfig::frameRenderingClones(bool defaultValue) const
 {
     const int defaultClonesCount = qMax(1, maxNumberOfThreads(defaultValue) / 2);

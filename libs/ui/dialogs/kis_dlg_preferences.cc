@@ -2032,6 +2032,10 @@ void PerformanceTab::load(bool requestDefault)
 
     chkPerformanceLogging->setChecked(cfg.enablePerfLog(requestDefault));
     chkProgressReporting->setChecked(cfg.enableProgressReporting(requestDefault));
+    chkGpuBrushCompositing->setChecked(cfg.useGpuBrushCompositing(requestDefault));
+#ifndef Q_OS_WIN
+    chkGpuBrushCompositing->setVisible(false);
+#endif
 
     sliderSwapSize->setValue(cfg.maxSwapSize(requestDefault) / 1024);
     swapFileLocation->setFileName(cfg.swapDir(requestDefault));
@@ -2101,6 +2105,7 @@ void PerformanceTab::save()
 
     cfg.setEnablePerfLog(chkPerformanceLogging->isChecked());
     cfg.setEnableProgressReporting(chkProgressReporting->isChecked());
+    cfg.setUseGpuBrushCompositing(chkGpuBrushCompositing->isChecked());
 
     cfg.setMaxSwapSize(sliderSwapSize->value() * 1024);
 
