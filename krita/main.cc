@@ -434,7 +434,10 @@ if (!qEnvironmentVariableIsEmpty("KRITA_OPENGL_DEBUG")) {
         const QString preferredRendererString = kritarc.value("OpenGLRenderer", "auto").toString();
 #endif
         preferredRenderer = KisOpenGL::convertConfigToOpenGLRenderer(preferredRendererString);
-        if (qEnvironmentVariableIsSet("KRITA_GPU_NATIVE_CANVAS")) preferredRenderer=KisOpenGL::RendererDesktopGL;
+        if (qEnvironmentVariableIsSet("KRITA_GPU_NATIVE_CANVAS")) {
+            preferredRenderer=qgetenv("KRITA_GPU_NATIVE_CANVAS")=="wgl" ?
+                KisOpenGL::RendererDesktopGL : KisOpenGL::RendererOpenGLES;
+        }
 
         const KisConfig::CanvasSurfaceBitDepthMode bitDepthMode =
             KisConfig::canvasSurfaceBitDepthMode(&kritarc);

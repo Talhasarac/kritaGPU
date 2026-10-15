@@ -96,6 +96,11 @@ struct PresentationTile {
     std::uint32_t buffer=0;
     std::uint64_t byteOffset=0,version=0;
     PixelFormat format=PixelFormat::RGBA8;
+    int textureX=0,textureY=0;
+};
+struct AnglePresentation {
+    void *shareHandle=nullptr;
+    std::vector<PresentationTile> tiles;
 };
 struct Checkpoint {
     bool success=false;
@@ -120,8 +125,11 @@ public:
     Result render(Batch &batch);
     std::string diagnostic();
     void shutdown();
-    // Call with a current native desktop GL canvas. ANGLE keeps CPU mirroring.
+    // Call with a current native desktop GL canvas.
     void configureNativeCanvas(void *context, void *dc);
+    // ANGLE presents ordinary RGBA8 strokes through a shared D3D11 texture.
+    bool configureAngleCanvas(void *d3d11Device);
+    AnglePresentation prepareAnglePresentation(std::uint64_t key);
     void registerCanvas(std::uint64_t key, std::uint64_t token, std::function<void()> repaint);
     void unregisterCanvas(std::uint64_t key, std::uint64_t token);
     bool canPresent(std::uint64_t key);

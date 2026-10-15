@@ -91,6 +91,7 @@ public:
     bool internalColorManagementActive() const;
     bool canUseGpuBrushProjection() const;
     void updateFromGpuBrush(const std::vector<KisGpuBrush::PresentationTile> &tiles);
+    void updateFromGpuBrushTexture(const std::vector<KisGpuBrush::PresentationTile> &tiles);
     bool setInternalColorManagementActive(bool value, bool iniializing = false);
 
     /**

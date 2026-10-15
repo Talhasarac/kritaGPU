@@ -2,8 +2,9 @@
 
 This fork adds a shared OpenGL 4.3 compute service to Krita on Windows. Pixel
 Brushes can generate supported tips and composite ordered dabs on the GPU.
-Color Smudge has a fused GPU mixing path. An optional native OpenGL canvas
-can display eligible strokes before their pixels are downloaded to the CPU.
+Color Smudge has a fused GPU mixing path. The Windows direct canvas uses a
+shared D3D11 texture to display eligible RGBA8 strokes while their pixels
+remain on the GPU.
 These features are experimental and retain Krita's CPU fallback.
 
 ## Run
@@ -12,16 +13,25 @@ Extract the portable package and start `bin/krita.exe`. GPU brushes are enabled
 by default on Windows. The preference is under **Settings > Configure Krita >
 Performance > Advanced > GPU accelerated Pixel Brushes (experimental)**.
 
-Start `Krita GPU Native Canvas.cmd` to request desktop OpenGL for the direct
-canvas path. The ordinary executable also supports compute painting when its
-canvas uses ANGLE. The launcher changes the renderer for that process only.
+Start `Krita GPU Direct Canvas.cmd` to select ANGLE/D3D11 presentation for
+this process. The older `Krita GPU Native Canvas.cmd` uses the same route.
+Direct canvas sharing is also attempted automatically with the ordinary
+executable when GPU brushes and a compatible ANGLE canvas are enabled.
 
-Local limitation: context sharing initialized successfully on the RTX 3050 Ti,
-but the desktop OpenGL window appeared blank in the computer capture, including
-with canvas sharing disabled. The standard ANGLE window displayed correctly.
-Use the ordinary executable on this host. Direct presentation and its complete
-stroke/checkpoint lifecycle have not been confirmed through a visible live
-stroke here; that path needs further validation before production use.
+The brush compositor still runs native OpenGL compute. It shares a 16 MiB
+D3D11 texture through `WGL_NV_DX_interop2` and EGL; canvas updates do not
+read brush pixels back to the CPU. A second 16 MiB GPU texture handles the
+document's canvas background when needed. Drivers without the required
+interop capability keep CPU mirroring. Local hardware: RTX 3050 Ti.
+
+For an eligible stroke, select **F5 > Painting Mode > Build up**, use an RGBA8
+image with one unmasked full-opacity Normal paint layer, and keep the image
+and display color spaces identical. Wash mode, layers/masks, color-converted
+projections, and other pixel formats retain CPU mirroring on ANGLE.
+
+Pure desktop WGL remains available with `KRITA_GPU_NATIVE_CANVAS=wgl`.
+Its frame buffer contained correct pixels here, but the native window capture
+was white. The D3D11 bridge avoids that presentation/capture problem.
 
 ## Features and limits
 
@@ -32,7 +42,7 @@ stroke here; that path needs further validation before production use.
 | Image tips | Static alpha masks and image stamps; cached mip images, GPU affine sampling, mirroring | Animated/pipe tips, lightness maps and gradient maps |
 | Texture | Multiply, Subtract and Darken alpha texture, soft/hard strength, canvas alignment | Other texture operations and sharpness postprocessing materialize the CPU tip |
 | Smudge | Mask brush per-pixel smear/dulling, color-rate mixing, final mask/selection/compositing | Source snapshots and dulling color sampling remain CPU; stamp/lightness, mirror and two-painter overlay strategies fall back |
-| Direct canvas | Shared native desktop OpenGL context, a single unmasked full-opacity Normal paint layer, direct Build-up painting, LOD 0, matching document/display color space and enabled channels | ANGLE, indirect/Wash targets, layer stacks/masks and color-converted projections use CPU mirroring per update |
+| Direct canvas | ANGLE/D3D11 RGBA8 bridge, one unmasked full-opacity Normal paint layer, Build-up painting, LOD 0, matching document/display color space and enabled channels | Other ANGLE pixel formats, indirect/Wash targets, layer stacks/masks and color-converted projections use CPU mirroring per update |
 
 GPU blend operations: Normal, creamy/hard Alpha Darken, Erase, Copy, Multiply,
 Screen, Overlay, Darken, Lighten, Add, Subtract, Difference, Exclusion, Color
@@ -64,9 +74,13 @@ all presets or of a fully GPU-native document model.
    Lists are split into dispatches of at most 256 dabs, with memory barriers.
 5. In the normal path, completed dirty output is downloaded and written through
    `KisPaintDevice::writeBytes` inside the existing undo transaction.
-6. In the direct canvas path, GPU cells stay pinned and are copied from a shared
-   storage buffer/PBO into existing canvas textures. The canvas and compute
-   contexts exchange fences. Updates have zero pixel readback. The stroke
+6. In the direct canvas path, GPU cells stay pinned. The native worker copies
+   changed cells from its storage buffer/PBO into a D3D11 texture on the same
+   adapter. ANGLE imports the shared handle with a matching EGL configuration.
+   GPU framebuffer blits copy into Krita canvas tiles, including their edge
+   padding. A shader composites the configured canvas background when needed.
+   WGL interop locking and a completed ANGLE GPU copy protect ownership.
+   Updates have zero pixel readback. The stroke
    checkpoints to CPU storage before its transaction closes, when the cache
    fills, or before CPU fallback. Cancellation drops pending GPU work. A retained
    dab journal can replay pending updates if a GPU checkpoint fails.
@@ -80,7 +94,7 @@ intersecting dab pixels to use compute. Smudge needs at least 65,536 pixels.
 Tip deferral also normally starts at 65,536 pixels to avoid adding profile
 setup overhead to small CPU brush updates.
 Transfers can outweigh compute savings, particularly on small or lightly
-spaced brushes. The native canvas can reduce transfers for eligible strokes.
+spaced brushes. The direct canvas reduces transfers for eligible strokes.
 
 ## Measurements
 
@@ -101,6 +115,14 @@ cells, logged total upload fell from 3,412,140 to 2,375,852 bytes. The generated
 dab displayed in the packaged ANGLE build. These are transfer measurements,
 not an end-to-end speed or input-latency comparison.
 
+The direct ANGLE canvas was exercised live with a 1000px Build-up Pixel Brush
+on a 2048 x 2048 RGBA8 image, without forcing the workload thresholds. Two
+eight-dab GPU batches presented 45 canvas cells with zero pixel readback per
+update. The stroke-end checkpoint downloaded 16,777,216 bytes for the two
+updates. The configured white background displayed correctly, and the result
+was saved to `krita-gpu-direct-canvas.kra`. This confirms the presentation
+route on the local NVIDIA adapter; it is not an end-to-end speed measurement.
+
 ## Build
 
 Shallow clone:
@@ -120,7 +142,7 @@ cmake --install build
 Rebuild all plugins when updating from the earlier GPU version: the lazy dab
 metadata changes a shared core class. The new `kritagpubrush` library is shared
 by the image library, paintops and native canvas. The backend uses Windows
-`opengl32`, `gdi32` and `user32`; CUDA and Vulkan SDKs are not required.
+`opengl32`, `gdi32`, `user32`, `d3d11` and `dxgi`; CUDA and Vulkan SDKs are not required.
 
 The standalone backend can also be built from
 `plugins/paintops/defaultpaintops/brush/gpu/tests`. Its existing check cases do
@@ -132,8 +154,9 @@ not cover every added format, mode, generated tip or direct canvas path.
 - `KRITA_GPU_BRUSH_LOG=1`: log dispatches, transfers, resident hits and checkpoints.
 - `KRITA_GPU_BRUSH_CPU_TIPS=1`: keep original CPU tip generation.
 - `KRITA_GPU_BRUSH_NO_RESIDENCY=1`: disable atlas reuse and direct presentation.
-- `KRITA_GPU_NATIVE_CANVAS=1`: request desktop OpenGL at process startup.
-- `KRITA_GPU_BRUSH_NO_CANVAS_SHARE=1`: isolate native rendering from sharing.
+- `KRITA_GPU_NATIVE_CANVAS=1`: select ANGLE/D3D11 for the direct canvas bridge.
+- `KRITA_GPU_NATIVE_CANVAS=wgl`: select the legacy desktop OpenGL sharing path.
+- `KRITA_GPU_BRUSH_NO_CANVAS_SHARE=1`: keep compute but disable direct presentation.
 
 The program is labeled **Krita Pixel Brush compute**; dispatch debug groups are
 **Krita GPU Pixel Brush batch**. Storage buffers are labeled by purpose.

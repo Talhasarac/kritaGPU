@@ -11,7 +11,7 @@ target_compile_definitions(krita_gpu_brush_compute_test PRIVATE KRITA_GPU_BRUSH_
 target_link_libraries(krita_gpu_brush_compute_test PRIVATE Threads::Threads)
 if(WIN32)
     target_sources(krita_gpu_brush_compute_test PRIVATE ../../../../../../krita/windows_gpu_preference.cpp)
-    target_link_libraries(krita_gpu_brush_compute_test PRIVATE opengl32 gdi32 user32)
+    target_link_libraries(krita_gpu_brush_compute_test PRIVATE opengl32 gdi32 user32 d3d11 dxgi)
 endif()
 if(MSVC)
     target_compile_options(krita_gpu_brush_compute_test PRIVATE /W4 /fp:strict)

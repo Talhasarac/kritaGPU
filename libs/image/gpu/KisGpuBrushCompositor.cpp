@@ -35,6 +35,8 @@
 #endif
 #include <windows.h>
 #include <GL/gl.h>
+#include <d3d11.h>
+#include <dxgi.h>
 #endif
 
 namespace KisGpuBrush
@@ -278,6 +280,7 @@ public:
     ~GlWorker()
     {
         if (m_context) {
+            releaseDxInterop();
             if (m_gl.DeleteBuffers) m_gl.DeleteBuffers(6, m_buffers);
             if (m_program && m_gl.DeleteProgram) m_gl.DeleteProgram(m_program);
             wglMakeCurrent(nullptr, nullptr);
@@ -301,7 +304,7 @@ public:
             m_gl.PushDebugGroup(0x824A, 0, -1, "Krita GPU Pixel Brush batch");
             debugGroup = true;
             const bool resident = prepareResidentTiles(batch, result);
-            if (batch.deferReadback && (!resident || !sharedCanvas)) {
+            if (batch.deferReadback && (!resident || !(sharedCanvas || m_dxInterop))) {
                 m_gl.PopDebugGroup();
                 result.message="GPU stroke needs a CPU checkpoint before continuing";
                 return result;
@@ -462,7 +465,120 @@ public:
         initialize();
     }
 
+    bool configureAngle(void *angleDevice)
+    {
+        if (m_dxInterop) return true;
+        if (!available || !angleDevice) return false;
+        IDXGIDevice *dxgiDevice=nullptr;
+        IDXGIAdapter *adapter=nullptr;
+        IDXGIResource *resource=nullptr;
+        try {
+            // A separate D3D device avoids using ANGLE's immediate context from
+            // the compute thread. The shared resource stays on the same GPU.
+            auto *source=static_cast<ID3D11Device *>(angleDevice);
+            if (FAILED(source->QueryInterface(__uuidof(IDXGIDevice),reinterpret_cast<void **>(&dxgiDevice))) ||
+                FAILED(dxgiDevice->GetAdapter(&adapter))) throw std::runtime_error("Cannot find ANGLE's GPU adapter");
+            if (FAILED(D3D11CreateDevice(adapter,D3D_DRIVER_TYPE_UNKNOWN,nullptr,0,nullptr,0,D3D11_SDK_VERSION,
+                                        &m_dxDevice,nullptr,nullptr))) throw std::runtime_error("Cannot create canvas transfer device");
+            GlFunctions::resolve(m_dxOpen,"wglDXOpenDeviceNV");
+            GlFunctions::resolve(m_dxClose,"wglDXCloseDeviceNV");
+            GlFunctions::resolve(m_dxRegister,"wglDXRegisterObjectNV");
+            GlFunctions::resolve(m_dxUnregister,"wglDXUnregisterObjectNV");
+            GlFunctions::resolve(m_dxLock,"wglDXLockObjectsNV");
+            GlFunctions::resolve(m_dxUnlock,"wglDXUnlockObjectsNV");
+            m_dxInterop=m_dxOpen(m_dxDevice);
+            if (!m_dxInterop) throw std::runtime_error("The OpenGL driver cannot share D3D11 textures");
+            D3D11_TEXTURE2D_DESC desc={};
+            desc.Width=residentTileSize*4; desc.Height=residentTileSize*16;
+            desc.MipLevels=desc.ArraySize=1; desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
+            desc.SampleDesc.Count=1; desc.Usage=D3D11_USAGE_DEFAULT;
+            desc.BindFlags=D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_RENDER_TARGET;
+            desc.MiscFlags=D3D11_RESOURCE_MISC_SHARED;
+            if (FAILED(m_dxDevice->CreateTexture2D(&desc,nullptr,&m_dxTexture)) ||
+                FAILED(m_dxTexture->QueryInterface(__uuidof(IDXGIResource),reinterpret_cast<void **>(&resource))) ||
+                FAILED(resource->GetSharedHandle(&m_dxShareHandle))) throw std::runtime_error("Cannot allocate shared canvas texture");
+            glGenTextures(1,&m_dxGlTexture);
+            m_dxObject=m_dxRegister(m_dxInterop,m_dxTexture,m_dxGlTexture,GL_TEXTURE_2D,0x0001 /* READ_WRITE_NV */);
+            if (!m_dxObject) throw std::runtime_error("Cannot register shared canvas texture with OpenGL");
+            resource->Release(); adapter->Release(); dxgiDevice->Release();
+            message+="; direct ANGLE/D3D11 canvas ready";
+            return true;
+        } catch (const std::exception &error) {
+            if (resource) resource->Release();
+            if (adapter) adapter->Release();
+            if (dxgiDevice) dxgiDevice->Release();
+            releaseDxInterop();
+            message+="; "+std::string(error.what());
+            return false;
+        }
+    }
+    bool canPresent() const { return sharedCanvas || m_dxInterop; }
+    AnglePresentation prepareAngle(std::uint64_t key)
+    {
+        AnglePresentation result;
+        if (!m_dxInterop || !m_dxObject) return result;
+        result.shareHandle=m_dxShareHandle;
+        result.tiles=presentation(key);
+        if (result.tiles.empty()) return result;
+        bool locked=false;
+        try {
+            if (!m_dxLock(m_dxInterop,1,&m_dxObject)) throw std::runtime_error("Cannot acquire shared canvas texture");
+            locked=true;
+            m_gl.BindBuffer(0x88EC /* PIXEL_UNPACK_BUFFER */,m_buffers[5]);
+            glBindTexture(GL_TEXTURE_2D,m_dxGlTexture);
+            glPixelStorei(0x0CF2 /* UNPACK_ROW_LENGTH */,residentTileSize);
+            glPixelStorei(GL_UNPACK_ALIGNMENT,1);
+            for (auto &tile:result.tiles) {
+                if (tile.format!=PixelFormat::RGBA8) throw std::runtime_error("ANGLE direct canvas requires RGBA8");
+                const unsigned slot=tile.byteOffset/(slotWords*4);
+                tile.textureX=(slot%4)*residentTileSize;
+                tile.textureY=(slot/4)*residentTileSize;
+                if (m_dxVersions[slot]==tile.version) continue;
+                glTexSubImage2D(GL_TEXTURE_2D,0,tile.textureX,tile.textureY,tile.width,tile.height,
+                               0x80E1 /* BGRA */,GL_UNSIGNED_BYTE,reinterpret_cast<void *>(std::uintptr_t(tile.byteOffset)));
+                m_dxVersions[slot]=tile.version;
+            }
+            m_gl.BindBuffer(0x88EC,0);
+            glPixelStorei(0x0CF2,0);
+            checkError("copying GPU stroke into shared canvas texture");
+            if (!m_dxUnlock(m_dxInterop,1,&m_dxObject)) throw std::runtime_error("Cannot release shared canvas texture");
+            locked=false;
+            result.shareHandle=m_dxShareHandle;
+        } catch (const std::exception &error) {
+            if (locked) m_dxUnlock(m_dxInterop,1,&m_dxObject);
+            releaseDxInterop();
+            message+="; "+std::string(error.what());
+            return {};
+        }
+        return result;
+    }
+
 private:
+    void releaseDxInterop()
+    {
+        if (m_dxObject && m_dxUnregister) m_dxUnregister(m_dxInterop,m_dxObject);
+        m_dxObject=nullptr;
+        if (m_dxGlTexture) glDeleteTextures(1,&m_dxGlTexture);
+        m_dxGlTexture=0;
+        if (m_dxInterop && m_dxClose) m_dxClose(m_dxInterop);
+        m_dxInterop=nullptr;
+        if (m_dxTexture) m_dxTexture->Release();
+        m_dxTexture=nullptr;
+        if (m_dxDevice) m_dxDevice->Release();
+        m_dxDevice=nullptr; m_dxShareHandle=nullptr;
+        std::fill_n(m_dxVersions,64,0);
+    }
+    ID3D11Device *m_dxDevice=nullptr;
+    ID3D11Texture2D *m_dxTexture=nullptr;
+    HANDLE m_dxInterop=nullptr,m_dxObject=nullptr,m_dxShareHandle=nullptr;
+    GLuint m_dxGlTexture=0;
+    std::uint64_t m_dxVersions[64]={};
+    HANDLE (WINAPI *m_dxOpen)(void *)=nullptr;
+    BOOL (WINAPI *m_dxClose)(HANDLE)=nullptr;
+    HANDLE (WINAPI *m_dxRegister)(HANDLE,void *,GLuint,GLenum,GLenum)=nullptr;
+    BOOL (WINAPI *m_dxUnregister)(HANDLE,HANDLE)=nullptr;
+    BOOL (WINAPI *m_dxLock)(HANDLE,GLint,HANDLE *)=nullptr;
+    BOOL (WINAPI *m_dxUnlock)(HANDLE,GLint,HANDLE *)=nullptr;
     static constexpr unsigned maxResidentTiles = 64;
     static constexpr std::size_t cellPixels = residentTileSize * residentTileSize;
     static constexpr std::size_t slotWords = cellPixels * 4;
@@ -719,6 +835,9 @@ public:
     Checkpoint checkpoint(std::uint64_t,std::uint64_t) { return {}; }
     void discard(std::uint64_t) {}
     void restartSharing() {}
+    bool configureAngle(void *) { return false; }
+    bool canPresent() const { return false; }
+    AnglePresentation prepareAngle(std::uint64_t) { return {}; }
 };
 #endif
 }
@@ -727,8 +846,7 @@ struct Compositor::Private
 {
     std::mutex presentationMutex;
     GlWorker *workerPointer=nullptr;
-    struct Canvas { std::uint64_t token; std::function<void()> repaint; };
-    std::map<std::uint64_t,Canvas> canvases;
+    std::map<std::uint64_t,std::map<std::uint64_t,std::function<void()>>> canvases;
     std::mutex mutex;
     std::condition_variable wake;
     std::deque<std::function<void(GlWorker &)>> work;
@@ -815,7 +933,7 @@ Result Compositor::render(Batch &batch)
             auto result=worker.render(batch);
             if (result.success && batch.deferReadback) {
                 const auto canvas=m_d->canvases.find(batch.presentationKey);
-                if (canvas!=m_d->canvases.end()) canvas->second.repaint();
+                if (canvas!=m_d->canvases.end()) for (const auto &view:canvas->second) view.second();
             }
             return result;
         });
@@ -849,18 +967,31 @@ void Compositor::configureNativeCanvas(void *context,void *dc)
 void Compositor::registerCanvas(std::uint64_t key,std::uint64_t token,std::function<void()> repaint)
 {
     std::lock_guard<std::mutex> lock(m_d->presentationMutex);
-    m_d->canvases[key]={token,std::move(repaint)};
+    m_d->canvases[key][token]=std::move(repaint);
 }
 void Compositor::unregisterCanvas(std::uint64_t key,std::uint64_t token)
 {
     std::lock_guard<std::mutex> lock(m_d->presentationMutex);
     const auto it=m_d->canvases.find(key);
-    if (it!=m_d->canvases.end() && it->second.token==token) m_d->canvases.erase(it);
+    if (it!=m_d->canvases.end()) {
+        it->second.erase(token);
+        if (it->second.empty()) m_d->canvases.erase(it);
+    }
 }
 bool Compositor::canPresent(std::uint64_t key)
 {
     std::lock_guard<std::mutex> lock(m_d->presentationMutex);
-    return m_d->workerPointer && m_d->workerPointer->available && m_d->workerPointer->sharedCanvas && m_d->canvases.count(key);
+    return m_d->workerPointer && m_d->workerPointer->available && m_d->workerPointer->canPresent() && m_d->canvases.count(key);
+}
+bool Compositor::configureAngleCanvas(void *device)
+{
+    try { return m_d->submit<bool>([=](GlWorker &worker) { return worker.configureAngle(device); }); }
+    catch (const std::exception &) { return false; }
+}
+AnglePresentation Compositor::prepareAnglePresentation(std::uint64_t key)
+{
+    try { return m_d->submit<AnglePresentation>([=](GlWorker &worker) { return worker.prepareAngle(key); }); }
+    catch (const std::exception &) { return {}; }
 }
 bool Compositor::hasPresentation(std::uint64_t key)
 {

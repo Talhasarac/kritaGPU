@@ -6,6 +6,7 @@
 
 #define GL_GLEXT_PROTOTYPES
 #include "kis_texture_tile.h"
+#include <QOpenGLExtraFunctions>
 #include "kis_texture_tile_update_info.h"
 #include "KisOpenGLBufferCircularStorage.h"
 #include <QVector>
@@ -199,6 +200,39 @@ void KisTextureTile::updateFromGpuBuffer(const KisGpuBrush::PresentationTile &so
     f->glPixelStorei(GL_UNPACK_ALIGNMENT,oldAlignment);
     f->glBindBuffer(GL_PIXEL_UNPACK_BUFFER,oldBuffer);
     f->glBindTexture(GL_TEXTURE_2D,oldTexture);
+    setNeedsMipmapRegeneration();
+}
+
+void KisTextureTile::updateFromGpuTexture(const KisGpuBrush::PresentationTile &source,const QRect &imageBounds)
+{
+    const QRect sourceRect(source.x,source.y,source.width,source.height);
+    const QRect patch=sourceRect & m_textureRectInImagePixels & imageBounds;
+    if (patch.isEmpty()) return;
+    auto *extra=QOpenGLContext::currentContext()->extraFunctions();
+    extra->glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,m_textureId,0);
+    const auto copy=[&](const QRect &destination,const QPoint &from) {
+        const QPoint dst=destination.topLeft()-m_textureRectInImagePixels.topLeft();
+        const int sx=source.textureX+from.x()-source.x,sy=source.textureY+from.y()-source.y;
+        extra->glBlitFramebuffer(sx,sy,sx+destination.width(),sy+destination.height(),
+            dst.x(),dst.y(),dst.x()+destination.width(),dst.y()+destination.height(),GL_COLOR_BUFFER_BIT,GL_NEAREST);
+    };
+    copy(patch,patch.topLeft());
+    // Replicate edge texels into the existing canvas tile's sampling border.
+    for (int y=m_textureRectInImagePixels.top();y<=m_textureRectInImagePixels.bottom();++y) {
+        if (y>=imageBounds.top() && y<=imageBounds.bottom()) continue;
+        const int sy=qBound(imageBounds.top(),y,imageBounds.bottom());
+        if (sourceRect.contains(QPoint(patch.left(),sy))) copy(QRect(patch.left(),y,patch.width(),1),QPoint(patch.left(),sy));
+    }
+    for (int x=m_textureRectInImagePixels.left();x<=m_textureRectInImagePixels.right();++x) {
+        if (x>=imageBounds.left() && x<=imageBounds.right()) continue;
+        const int sx=qBound(imageBounds.left(),x,imageBounds.right());
+        if (sourceRect.contains(QPoint(sx,patch.top()))) copy(QRect(x,patch.top(),1,patch.height()),QPoint(sx,patch.top()));
+        for (int y=m_textureRectInImagePixels.top();y<=m_textureRectInImagePixels.bottom();++y) {
+            if (y>=imageBounds.top() && y<=imageBounds.bottom()) continue;
+            const QPoint from(sx,qBound(imageBounds.top(),y,imageBounds.bottom()));
+            if (sourceRect.contains(from)) copy(QRect(x,y,1,1),from);
+        }
+    }
     setNeedsMipmapRegeneration();
 }
 

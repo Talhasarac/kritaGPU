@@ -31,6 +31,7 @@
 #include <QOpenGLExtraFunctions>
 #ifdef Q_OS_WIN
 #include <qt_windows.h>
+#include "KisGpuAngleCanvasBridge.h"
 #endif
 
 #include "config-qt-patches-present.h"
@@ -72,6 +73,9 @@ struct KisOpenGLCanvas2::Private
 {
 public:
     ~Private() {
+#ifdef Q_OS_WIN
+        angleBridge.reset();
+#endif
         delete renderer;
     }
 
@@ -85,6 +89,10 @@ public:
     KisRepaintDebugger repaintDbg;
     std::uint64_t gpuImageKey=0;
     bool gpuRegistered=false;
+    bool gpuReady=false;
+#ifdef Q_OS_WIN
+    std::unique_ptr<KisGpuAngleCanvasBridge> angleBridge;
+#endif
 };
 
 KisOpenGLCanvas2::KisOpenGLCanvas2(KisCanvas2 *canvas,
@@ -232,20 +240,28 @@ void KisOpenGLCanvas2::initializeGL()
     d->renderer->initializeGL();
     KisOpenGLSync::init(context());
 #ifdef Q_OS_WIN
-    if (KisImageConfig(true).useGpuBrushCompositing() && !context()->isOpenGLES() && wglGetCurrentContext() &&
+    if (KisImageConfig(true).useGpuBrushCompositing() &&
         !qEnvironmentVariableIsSet("KRITA_GPU_BRUSH_NO_CANVAS_SHARE")) {
         auto &gpu=KisGpuBrush::Compositor::instance();
-        gpu.configureNativeCanvas(wglGetCurrentContext(),wglGetCurrentDC());
-        qInfo()<<"Native canvas renderer:"<<reinterpret_cast<const char *>(context()->functions()->glGetString(GL_RENDERER));
+        if (context()->isOpenGLES()) {
+            d->angleBridge=std::make_unique<KisGpuAngleCanvasBridge>();
+            d->gpuReady=d->angleBridge->initialize();
+            if (!d->gpuReady) d->angleBridge.reset();
+        } else if (wglGetCurrentContext()) {
+            gpu.configureNativeCanvas(wglGetCurrentContext(),wglGetCurrentDC());
+            d->gpuReady=d->renderer->openGLImageTextures()->image()->defaultProjectionColor().opacityU8()==0;
+        }
+        qInfo()<<"GPU canvas renderer:"<<reinterpret_cast<const char *>(context()->functions()->glGetString(GL_RENDERER));
         qInfo().noquote()<<QString::fromStdString(gpu.diagnostic());
-        if (d->renderer->openGLImageTextures()->canUseGpuBrushProjection()) {
+        if (d->gpuReady && d->renderer->openGLImageTextures()->canUseGpuBrushProjection() &&
+            (!d->angleBridge || d->renderer->openGLImageTextures()->image()->colorSpace()->pixelSize()==4)) {
             gpu.registerCanvas(d->gpuImageKey,reinterpret_cast<std::uintptr_t>(this),[this] {
                 QMetaObject::invokeMethod(this,[this] {
                     d->canvasImageDirtyRect=rect(); update();
                 },Qt::QueuedConnection);
             });
             d->gpuRegistered=true;
-            qInfo()<<"Native GPU brush canvas sharing:"<<gpu.canPresent(d->gpuImageKey);
+            qInfo()<<"Direct GPU brush canvas sharing:"<<gpu.canPresent(d->gpuImageKey);
         }
     }
 #endif
@@ -275,11 +291,40 @@ void KisOpenGLCanvas2::paintGL()
     KisOpenglCanvasDebugger::instance()->notifyPaintRequested();
     QRect canvasImageDirtyRect = d->canvasImageDirtyRect & rect();
     d->canvasImageDirtyRect = QRect();
-    if (d->gpuRegistered && !d->renderer->openGLImageTextures()->canUseGpuBrushProjection()) {
+    bool compatibleGpuProjection=d->renderer->openGLImageTextures()->canUseGpuBrushProjection() &&
+        KisImageConfig(true).useGpuBrushCompositing();
+#ifdef Q_OS_WIN
+    compatibleGpuProjection=compatibleGpuProjection &&
+        (d->angleBridge ? d->renderer->openGLImageTextures()->image()->colorSpace()->pixelSize()==4 :
+            d->renderer->openGLImageTextures()->image()->defaultProjectionColor().opacityU8()==0);
+#endif
+    if (d->gpuRegistered && !compatibleGpuProjection) {
         KisGpuBrush::Compositor::instance().unregisterCanvas(d->gpuImageKey,reinterpret_cast<std::uintptr_t>(this));
         d->gpuRegistered=false;
     }
+    if (!d->gpuRegistered && d->gpuReady && compatibleGpuProjection) {
+        auto &gpu=KisGpuBrush::Compositor::instance();
+        gpu.registerCanvas(d->gpuImageKey,reinterpret_cast<std::uintptr_t>(this),[this] {
+            QMetaObject::invokeMethod(this,[this] { d->canvasImageDirtyRect=rect(); update(); },Qt::QueuedConnection);
+        });
+        d->gpuRegistered=true;
+    }
     if (d->gpuRegistered) {
+#ifdef Q_OS_WIN
+        if (d->angleBridge) {
+            auto &gpu=KisGpuBrush::Compositor::instance();
+            const auto frame=gpu.prepareAnglePresentation(d->gpuImageKey);
+            if (!d->angleBridge->update(d->renderer->openGLImageTextures().data(),frame)) {
+                gpu.unregisterCanvas(d->gpuImageKey,reinterpret_cast<std::uintptr_t>(this));
+                d->gpuRegistered=false;
+                d->gpuReady=false;
+                qWarning()<<"Direct GPU canvas import failed; subsequent updates use CPU checkpoints";
+            } else if (!frame.tiles.empty() && qEnvironmentVariableIsSet("KRITA_GPU_BRUSH_LOG")) {
+                qInfo()<<"Direct GPU canvas presented:"<<frame.tiles.size()<<"tiles, 0 pixel readback bytes";
+            }
+        } else
+#endif
+        {
         KisGpuBrush::Compositor::instance().present(d->gpuImageKey,[this](const auto &tiles)->void * {
             d->renderer->openGLImageTextures()->updateFromGpuBrush(tiles);
             auto *f=context()->extraFunctions();
@@ -287,6 +332,7 @@ void KisOpenGLCanvas2::paintGL()
             f->glFlush();
             return reinterpret_cast<void *>(fence);
         });
+        }
     }
     d->renderer->paintCanvasOnly(canvasImageDirtyRect, updateRect);
     {

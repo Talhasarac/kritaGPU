@@ -56,6 +56,7 @@ public:
 
     void update(const KisTextureTileUpdateInfo &updateInfo, bool blockMipmapRegeneration);
     void updateFromGpuBuffer(const KisGpuBrush::PresentationTile &source, const QRect &imageBounds);
+    void updateFromGpuTexture(const KisGpuBrush::PresentationTile &source, const QRect &imageBounds);
 
     inline QRect tileRectInImagePixels() {
         return m_tileRectInImagePixels;

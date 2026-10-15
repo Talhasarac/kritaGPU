@@ -305,6 +305,12 @@ void KisOpenGLImageTextures::updateFromGpuBrush(const std::vector<KisGpuBrush::P
     for (const auto &source:tiles) for (auto *tile:m_textureTiles) tile->updateFromGpuBuffer(source,m_image->bounds());
 }
 
+void KisOpenGLImageTextures::updateFromGpuBrushTexture(const std::vector<KisGpuBrush::PresentationTile> &tiles)
+{
+    if (!canUseGpuBrushProjection()) return;
+    for (const auto &source:tiles) for (auto *tile:m_textureTiles) tile->updateFromGpuTexture(source,m_image->bounds());
+}
+
 void KisOpenGLImageTextures::recalculateCache(KisUpdateInfoSP info, bool blockMipmapRegeneration)
 {
     if (!m_initialized) {
