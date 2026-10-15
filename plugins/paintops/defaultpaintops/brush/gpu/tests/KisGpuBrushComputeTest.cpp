@@ -191,6 +191,38 @@ void benchmark()
               << " ms; GPU including transfers "
               << std::chrono::duration<double, std::milli>(finish - middle).count()
               << " ms. This is not a benchmark against Krita's SIMD compositor.\n";
+    const auto measure=[](Batch input,const char *name) {
+        for (int i=0;i<2;++i) require(Compositor::instance().render(input).success,name);
+        const auto begin=std::chrono::steady_clock::now();
+        Result r;
+        for (int i=0;i<5;++i) { r=Compositor::instance().render(input); require(r.success,r.message); }
+        std::cout<<name<<": "<<std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count()/5
+                 <<" ms/update; "<<r.uploadedBytes<<" bytes uploaded; "<<r.readbackBytes<<" bytes read back\n";
+    };
+    for (auto format:{PixelFormat::RGBA16,PixelFormat::RGBA16F,PixelFormat::RGBA32F}) {
+        auto wide=batch;
+        wide.format=format;
+        const auto words=wordsPerPixel(format);
+        wide.pixels.assign(512*512*words,0);
+        wide.sourcePixels.resize(wide.pixels.size());
+        std::uint32_t colour[4]={};
+        if (format==PixelFormat::RGBA16) { colour[0]=0x80004000; colour[1]=0x4000ffff; }
+        else if (format==PixelFormat::RGBA16F) { colour[0]=0x38003400; colour[1]=0x34004000; }
+        else { const float values[]={0.25f,0.5f,2.0f,0.25f}; std::memcpy(colour,values,sizeof(colour)); }
+        for (std::size_t p=0;p<wide.pixels.size();p+=words) std::copy_n(colour,words,wide.sourcePixels.data()+p);
+        measure(wide,format==PixelFormat::RGBA16 ? "RGBA16" : format==PixelFormat::RGBA16F ? "RGBA16F HDR" : "RGBA32F HDR");
+    }
+    auto procedural=batch;
+    procedural.sourcePixels.assign(1,0);
+    for (auto &dab:procedural.dabs) {
+        dab.data[1]=1; dab.data[2]=1;
+        dab.shape[0]=dab.shape[1]=255.5f;
+        dab.shape[2]=dab.shape[3]=2.0f/512;
+        dab.transform[0]=1.0f;
+        dab.transform[2]=dab.transform[3]=4.0f/512;
+        dab.colour[0]=224; dab.colour[1]=160; dab.colour[2]=128; dab.colour[3]=255;
+    }
+    measure(procedural,"GPU-generated soft round tips");
 }
 }
 
@@ -199,6 +231,11 @@ int main(int argc, char **argv)
     try {
         require(Compositor::instance().isAvailable(), Compositor::instance().diagnostic());
         std::cout << Compositor::instance().diagnostic() << '\n';
+        if (argc>1 && std::strcmp(argv[1],"--benchmark-only")==0) {
+            benchmark();
+            Compositor::instance().shutdown();
+            return 0;
+        }
         compare(makeBatch(BlendMode::Over), "Normal, clipped tiles and selection");
         compare(makeBatch(BlendMode::Over, 7), "Normal with alpha lock");
         compare(makeBatch(BlendMode::Over, 10), "Normal with channel locks");

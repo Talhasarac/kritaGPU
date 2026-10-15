@@ -157,7 +157,7 @@ void KisGpuBrushPaintTest::testUnsupportedMode()
     auto device = makeDevice();
     const QByteArray before = readPixels(device);
     KisPainter painter(device);
-    painter.setCompositeOpId(COMPOSITE_MULT);
+    painter.setCompositeOpId(COMPOSITE_DISSOLVE);
     const auto dabs = makeDabs();
     QVERIFY(!KisGpuBrushPaint::shouldUse(&painter, {testRect}, dabs));
     QVERIFY(!KisGpuBrushPaint::tryPaint(&painter, {testRect}, dabs));

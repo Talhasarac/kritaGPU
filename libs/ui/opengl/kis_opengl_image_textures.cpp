@@ -33,6 +33,7 @@
 #include "kis_painting_tweaks.h"
 #include "KisOpenGLBufferCreationGuard.h"
 #include <KisPlatformPluginInterfaceFactory.h>
+#include <KisProofingConfiguration.h>
 
 /// we use Angle's EGL on Windows, so we need access to
 /// EGL_ANGLE_platform_angle definition
@@ -288,6 +289,22 @@ KisOpenGLUpdateInfoSP KisOpenGLImageTextures::updateCacheImpl(const QRect& rect,
     return m_updateInfoBuilder.buildUpdateInfo(rect, srcImage, convertColorSpace);
 }
 
+bool KisOpenGLImageTextures::canUseGpuBrushProjection() const
+{
+    const auto *destination=m_updateInfoBuilder.destinationColorSpace();
+    const auto proof=m_updateInfoBuilder.proofingConfig();
+    return m_initialized && m_gpuChannelsCompatible &&
+        (!proof || !proof->displayFlags.testFlag(KoColorConversionTransformation::SoftProofing)) &&
+        m_image && destination && *destination==*m_image->colorSpace() &&
+        m_image->colorSpace()->colorModelId()==RGBAColorModelID;
+}
+
+void KisOpenGLImageTextures::updateFromGpuBrush(const std::vector<KisGpuBrush::PresentationTile> &tiles)
+{
+    if (!canUseGpuBrushProjection()) return;
+    for (const auto &source:tiles) for (auto *tile:m_textureTiles) tile->updateFromGpuBuffer(source,m_image->bounds());
+}
+
 void KisOpenGLImageTextures::recalculateCache(KisUpdateInfoSP info, bool blockMipmapRegeneration)
 {
     if (!m_initialized) {
@@ -470,6 +487,7 @@ bool KisOpenGLImageTextures::setImageColorSpace(const KoColorSpace *cs)
 
 void KisOpenGLImageTextures::setChannelFlags(const QBitArray &channelFlags)
 {
+    m_gpuChannelsCompatible=channelFlags.isEmpty() || channelFlags.count(true)==channelFlags.size();
     QBitArray targetChannelFlags = channelFlags;
     int selectedChannels = 0;
     const KoColorSpace *projectionCs = m_image->projection()->colorSpace();

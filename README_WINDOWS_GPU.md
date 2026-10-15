@@ -1,161 +1,143 @@
-# Windows GPU Pixel Brushes
+# Windows GPU brushes
 
-This fork adds OpenGL compute compositing to Krita's existing Pixel Brush
-engine. The normal brush presets continue to generate their tips, dynamics,
-textures, and color on the CPU. Their prepared dabs are then blended on the
-GPU in ordered batches. This is an initial GPU painting implementation, not a
-port of every Krita brush engine.
+This fork adds a shared OpenGL 4.3 compute service to Krita on Windows. Pixel
+Brushes can generate supported tips and composite ordered dabs on the GPU.
+Color Smudge has a fused GPU mixing path. An optional native OpenGL canvas
+can display eligible strokes before their pixels are downloaded to the CPU.
+These features are experimental and retain Krita's CPU fallback.
 
-## Supported painting
+## Run
 
-- Windows with a native OpenGL 4.3 or newer driver.
-- RGB/Alpha, 8-bit integer paint devices, using the device's existing profile.
-- Normal (including alpha and color channel locks), Wash/Alpha Darken
-  (creamy and legacy hard flow), and Eraser.
-- Selection masks, pressure-dependent opacity/flow, existing brush tip
-  textures, and the normal undo/redo and document saving paths.
+Extract the portable package and start `bin/krita.exe`. GPU brushes are enabled
+by default on Windows. The preference is under **Settings > Configure Krita >
+Performance > Advanced > GPU accelerated Pixel Brushes (experimental)**.
 
-Unsupported color depths, blend operations, and wraparound painting use the
-existing CPU compositor. Small batches also use the CPU because transferring
-their pixels to the GPU can cost more than blending them. The initial threshold
-is four dabs and four million intersecting dab pixels per update.
+Start `Krita GPU Native Canvas.cmd` to request desktop OpenGL for the direct
+canvas path. The ordinary executable also supports compute painting when its
+canvas uses ANGLE. The launcher changes the renderer for that process only.
 
-The option is enabled by default on Windows. It is exposed in **Settings >
-Configure Krita > Performance > Advanced > GPU accelerated Pixel Brushes
-(experimental)**. Turn it off to compare with the original compositor. The
-native compute context operates separately from Qt's canvas context, including
-when the canvas uses ANGLE.
+Local limitation: context sharing initialized successfully on the RTX 3050 Ti,
+but the desktop OpenGL window appeared blank in the computer capture, including
+with canvas sharing disabled. The standard ANGLE window displayed correctly.
+Use the ordinary executable on this host. Direct presentation and its complete
+stroke/checkpoint lifecycle have not been confirmed through a visible live
+stroke here; that path needs further validation before production use.
+
+## Features and limits
+
+| Work | GPU support | CPU fallback / remaining CPU work |
+| --- | --- | --- |
+| Pixel Brush compositing | RGBA U8, U16, F16, F32; native channel order and document profile | Other color models, wraparound, unsupported blend modes and small batches |
+| Automatic tips | Default and Gaussian circular/elliptical generators, softness, edge antialiasing, scale, rotation, solid color | Other mask generators, spikes, randomness, density, tiny tips, gradient/lightness coloring |
+| Image tips | Static alpha masks and image stamps; cached mip images, GPU affine sampling, mirroring | Animated/pipe tips, lightness maps and gradient maps |
+| Texture | Multiply, Subtract and Darken alpha texture, soft/hard strength, canvas alignment | Other texture operations and sharpness postprocessing materialize the CPU tip |
+| Smudge | Mask brush per-pixel smear/dulling, color-rate mixing, final mask/selection/compositing | Source snapshots and dulling color sampling remain CPU; stamp/lightness, mirror and two-painter overlay strategies fall back |
+| Direct canvas | Shared native desktop OpenGL context, a single unmasked full-opacity Normal paint layer, direct Build-up painting, LOD 0, matching document/display color space and enabled channels | ANGLE, indirect/Wash targets, layer stacks/masks and color-converted projections use CPU mirroring per update |
+
+GPU blend operations: Normal, creamy/hard Alpha Darken, Erase, Copy, Multiply,
+Screen, Overlay, Darken, Lighten, Add, Subtract, Difference, Exclusion, Color
+Dodge, Color Burn, Hard Light, SVG Soft Light and Linear Burn. Channel locks are
+supported except for Alpha Darken and Erase, which retain the CPU path when
+locks are set. Float RGB values can exceed 1.0; alpha remains normalized.
+
+GPU floating point arithmetic and image sampling can differ slightly from
+Krita's CPU implementations. This is not a claim of byte-for-byte parity for
+all presets or of a fully GPU-native document model.
 
 ## Pipeline
 
-1. Krita's existing asynchronous dab executor prepares the brush tips. GPU
-   updates fetch at most 256 dabs and target eight million source pixels per
-   update, including the initial fetch, to keep long strokes inside the buffer
-   budget. The existing adaptive update limit can reduce this further.
-2. A sequential stroke job merges adjacent CPU scheduler patches, splits their
-   exact union at world-aligned 256 by 256 cell boundaries, and creates ordered
-   dab index lists. Only dirty intersections are dispatched and read back.
-3. A dedicated worker owns a native Windows OpenGL context and a 64 MiB paint
-   tile atlas. Each stroke has its own cache identity. Cells are initialized
-   from the CPU once, including their clean margins, then retain painted pixels
-   on the GPU across updates. Cache hits skip both CPU destination reads and
-   destination uploads. A bounded LRU evicts old cells. Device mutation counters,
-   animation time and level of detail invalidate stale stroke generations.
-   Other callers validate cached regions against their CPU input bytes.
-4. Unchanged source pixels, dab parameters, index lists and selections reuse
-   their GPU buffers, with a 16 MiB host comparison-cache limit per input buffer.
-   Byte comparison detects tip edits and mirroring. No mask
-   allocation or bulk upload is needed when there is no selection.
-5. A 16 by 16 compute workgroup assigns one invocation to each pixel. It blends
-   the contributing dabs in order and rounds to 8-bit storage after each dab.
-   Dense lists are split into ordered dispatches of at most 256 dabs.
-6. A storage/buffer memory barrier and fence precede dirty-pixel readback. Only a completed
-   batch is written through `KisPaintDevice::writeBytes`, inside the stroke's
-   existing undo transaction. Failed dispatches leave the CPU pixels untouched
-   and fall back to CPU painting.
+1. Krita still computes input dynamics, spacing, dab positions and scheduler
+   jobs on the CPU. Supported tips become small descriptors. Image mip levels
+   and texture masks are cached assets rather than regenerated dab images.
+   Gaussian tips cache a 4,097-sample CPU radial profile; GPU invocations expand
+   that profile into each rotated/scaled dab rather than uploading its pixels.
+   Unsupported CPU consumers can materialize an original Krita tip lazily.
+2. A sequential painting job builds an ordered dab list and the exact union of
+   dirty regions, split at world-aligned 256 x 256 tile boundaries. An update
+   fetches at most 256 dabs and targets eight million source words.
+3. A dedicated WGL worker owns compute programs, storage buffers and a bounded
+   64 MiB resident atlas. Complete cells are initialized from the CPU once.
+   Stroke identity, device mutation sequence, animation time and LOD control
+   reuse. Unpinned old cells can be evicted; inputs have bounded host caches.
+4. A 16 x 16 workgroup assigns a pixel to each invocation. Contributing dabs are
+   blended in order, quantized after each dab to the device's storage depth.
+   Lists are split into dispatches of at most 256 dabs, with memory barriers.
+5. In the normal path, completed dirty output is downloaded and written through
+   `KisPaintDevice::writeBytes` inside the existing undo transaction.
+6. In the direct canvas path, GPU cells stay pinned and are copied from a shared
+   storage buffer/PBO into existing canvas textures. The canvas and compute
+   contexts exchange fences. Updates have zero pixel readback. The stroke
+   checkpoints to CPU storage before its transaction closes, when the cache
+   fills, or before CPU fallback. Cancellation drops pending GPU work. A retained
+   dab journal can replay pending updates if a GPU checkpoint fails.
 
-Dirty output is still synchronized to Krita's CPU storage after each update for
-canvas projection, filters, undo and saving. This is GPU-resident stroke
-compositing with a CPU mirror; the canvas and document model are not entirely
-GPU-native. New cells, changing tips and cache evictions still require uploads.
-Performance depends on the GPU, transfer cost, brush size and dab overlap.
+The CPU remains authoritative for committed documents, filters, undo and saving.
+The direct canvas eligibility checks preserve the existing color management
+and layer projection behavior.
 
-Set `KRITA_GPU_BRUSH_NO_RESIDENCY=1` to disable cache reuse for comparison.
-The `testLargeBatchTiming` benchmark alternates resident and uncached GPU paths
-over five rounds of twelve updates for 16, 32 and 128 overlapping 512px dabs.
-It includes packing, synchronization, transfers and CPU writes, and requires
-both GPU paths to produce identical output before reporting their timings.
-Its CPU figure is a single `KisPainter` call; ordinary strokes can distribute
-CPU painting across multiple cores. These are compositing measurements rather
-than an end-to-end tablet input and canvas latency benchmark.
+Small Pixel Brush updates normally need at least four dabs and four million
+intersecting dab pixels to use compute. Smudge needs at least 65,536 pixels.
+Tip deferral also normally starts at 65,536 pixels to avoid adding profile
+setup overhead to small CPU brush updates.
+Transfers can outweigh compute savings, particularly on small or lightly
+spaced brushes. The native canvas can reduce transfers for eligible strokes.
 
-The final local run on an RTX 3050 Ti measured the following medians, in
-milliseconds per update:
+## Measurements
 
-| 512px dabs per update | Upload every update | Resident stroke |
-| --- | ---: | ---: |
-| 16 | 2.21 | 1.81 |
-| 32 | 2.29 | 1.83 |
-| 128 | 3.58 | 3.09 |
+The earlier resident-compositor build, on an RTX 3050 Ti, reduced median time
+for 16/32/128 overlapping 512px dabs from 2.21/2.29/3.58 ms to 1.81/1.83/3.09 ms
+per update. Those are prior-build compositor measurements, not a latency claim
+for this expanded implementation.
 
-That run used 14–20% less time with residency. An earlier run showed 10–14%;
-GPU clocks and system load affect these timings. Warm repeated updates with
-identical tips logged zero destination and total uploaded bytes, while still
-reading back 1 MiB of dirty output per update. A live 512px stroke in a 4096px
-document used six compute batches and reused resident tiles between them.
+`krita_gpu_brush_compute_test --benchmark-only` runs performance workloads
+without executing the unit check suite. It exercises U8, U16, F16, F32 and
+GPU-generated soft round tips. The scalar reference is not Krita's optimized
+SIMD compositor. See the supplied measurement log for actual local results.
+A complete correctness suite has not been run for the new paths.
 
-## Clone with minimal history
+A live 512px Gaussian dab used a 16,388-byte radial profile in place of a
+1,052,676-byte bitmap (about 98% less tip data). With the same nine destination
+cells, logged total upload fell from 3,412,140 to 2,375,852 bytes. The generated
+dab displayed in the packaged ANGLE build. These are transfer measurements,
+not an end-to-end speed or input-latency comparison.
+
+## Build
+
+Shallow clone:
 
 ```powershell
 git clone --depth 1 --single-branch https://github.com/Talhasarac/kritaGPU.git
 ```
 
-## Build the standalone GPU check
-
-The compute backend can be compiled and checked without Qt or KDE dependencies:
+Use Krita's Windows LLVM MinGW toolchain and matching dependencies:
 
 ```powershell
-cmake -S plugins/paintops/defaultpaintops/brush/gpu/tests -B build-gpu -G "Visual Studio 17 2022" -A x64
-cmake --build build-gpu --config Release
-ctest --test-dir build-gpu -C Release --output-on-failure
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DCMAKE_INSTALL_PREFIX=path/to/install
+cmake --build build --parallel 6
+cmake --install build
 ```
 
-It executes real compute dispatches and checks Normal, Wash, Eraser, selection,
-channel locks, clipped tiles, dense batches, concurrent submissions, and
-invalid-batch handling against a scalar reference. It requires a working GPU;
-it does not substitute CPU rendering when a driver is unavailable.
+Rebuild all plugins when updating from the earlier GPU version: the lazy dab
+metadata changes a shared core class. The new `kritagpubrush` library is shared
+by the image library, paintops and native canvas. The backend uses Windows
+`opengl32`, `gdi32` and `user32`; CUDA and Vulkan SDKs are not required.
 
-The optional `krita_gpu_brush_compute_test --benchmark` compares a dense batch
-with that scalar reference. It is **not** a comparison with Krita's optimized
-SIMD compositor.
+The standalone backend can also be built from
+`plugins/paintops/defaultpaintops/brush/gpu/tests`. Its existing check cases do
+not cover every added format, mode, generated tip or direct canvas path.
 
-## Build Krita
+## Diagnostics and RenderDoc
 
-Use Krita's [Windows build instructions](https://docs.krita.org/en/untranslatable_pages/building_krita.html)
-and a matching LLVM MinGW dependency/toolchain environment. This backend needs
-only the Windows system libraries `opengl32`, `gdi32`, and `user32`; no CUDA SDK,
-Vulkan SDK, or proprietary shader is required.
+- `KRITA_GPU_BRUSH_FORCE=1`: bypass workload thresholds for supported operations.
+- `KRITA_GPU_BRUSH_LOG=1`: log dispatches, transfers, resident hits and checkpoints.
+- `KRITA_GPU_BRUSH_CPU_TIPS=1`: keep original CPU tip generation.
+- `KRITA_GPU_BRUSH_NO_RESIDENCY=1`: disable atlas reuse and direct presentation.
+- `KRITA_GPU_NATIVE_CANVAS=1`: request desktop OpenGL at process startup.
+- `KRITA_GPU_BRUSH_NO_CANVAS_SHARE=1`: isolate native rendering from sharing.
 
-With the dependency environment activated:
-
-```powershell
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DCMAKE_INSTALL_PREFIX=path/to/krita-install
-cmake --build build --target install --parallel 6
-```
-
-To run the focused integration checks after that build:
-
-```powershell
-cmake -S . -B build -DBUILD_TESTING=ON
-cmake --build build --target KisGpuBrushPaintTest --parallel 6
-ctest --test-dir build -R KisGpuBrushPaintTest --output-on-failure
-```
-
-The integration test compares displayed premultiplied color and alpha with
-`KisPainter` (within two 8-bit levels), checks
-selection and alpha lock, verifies undo/redo, and checks unsupported-mode
-fallback. Like other Krita tests it needs Krita's color-space plugins available
-in the configured test/runtime environment.
-
-GPU floating point rounding can differ slightly from Krita's CPU SIMD/FMA
-rounding. RGB bytes under fully transparent pixels can also differ, including
-where the CPU's selection code changes invisible RGB. The integration check
-therefore compares visible color and alpha rather than requiring identical
-unassociated RGB bytes at zero alpha.
-
-## Inspect dispatches
-
-Set `KRITA_GPU_BRUSH_FORCE=1` before starting the application to bypass the
-workload threshold for supported brushes. Set `KRITA_GPU_BRUSH_LOG=1` to log
-the dab and dispatch counts, resident tile hits, uploaded bytes and readback
-bytes. Remove these variables for normal use.
-
-RenderDoc debug groups are labeled **Krita GPU Pixel Brush batch**, the program
-is labeled **Krita Pixel Brush compute**, and the storage buffers have
-names describing their contents. A successful initialization log identifies
-the GPU selected by Windows for the native OpenGL context. Its adapter can
-differ from the canvas adapter on laptops with multiple GPUs.
-
-The Windows executables export NVIDIA's `NvOptimusEnablement` hint to request
-the discrete adapter on Optimus laptops. Windows or user graphics preferences
-can override this request; the initialization log reports the actual adapter.
+The program is labeled **Krita Pixel Brush compute**; dispatch debug groups are
+**Krita GPU Pixel Brush batch**. Storage buffers are labeled by purpose.
+`GPU direct brush batch` lines report zero readback bytes, followed by a
+`GPU stroke checkpoint` at synchronization. The initialization log identifies
+the actual adapter. The launchers export NVIDIA's Optimus preference hint;
+Windows graphics preferences may override it.

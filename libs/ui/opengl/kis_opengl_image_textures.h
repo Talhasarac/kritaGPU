@@ -89,6 +89,8 @@ public:
     void setProofingConfig(KisProofingConfigurationSP);
 
     bool internalColorManagementActive() const;
+    bool canUseGpuBrushProjection() const;
+    void updateFromGpuBrush(const std::vector<KisGpuBrush::PresentationTile> &tiles);
     bool setInternalColorManagementActive(bool value, bool iniializing = false);
 
     /**
@@ -214,6 +216,7 @@ private:
 
     bool m_useOcio {false};
     bool m_initialized {false};
+    bool m_gpuChannelsCompatible {true};
 
     KisOpenGLUpdateInfoBuilder m_updateInfoBuilder;
 };

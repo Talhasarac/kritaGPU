@@ -5,6 +5,7 @@
  */
 
 #include "freehand_stroke.h"
+#include <gpu/KisGpuBrushPaint.h>
 
 #include <QElapsedTimer>
 #include <QThread>
@@ -280,6 +281,9 @@ void FreehandStrokeStrategy::tryDoUpdate(bool forceEnd)
 
 void FreehandStrokeStrategy::issueSetDirtySignals()
 {
+    // A directly presented single-layer stroke bypasses CPU projection until
+    // its checkpoint. The GPU service schedules the canvas repaint instead.
+    if (targetNode()->paintDevice() && KisGpuBrushPaint::hasDeferred(targetNode()->paintDevice().data())) return;
     QVector<QRect> dirtyRects;
 
     for (int i = 0; i < numMaskedPainters(); i++) {

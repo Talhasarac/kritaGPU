@@ -8,6 +8,7 @@
 #include "kis_texture_tile.h"
 #include "kis_texture_tile_update_info.h"
 #include "KisOpenGLBufferCircularStorage.h"
+#include <QVector>
 
 #include <kis_debug.h>
 #if !defined(QT_OPENGL_ES)
@@ -149,6 +150,56 @@ void KisTextureTile::regenerateMipmap()
     f->glGenerateMipmap(GL_TEXTURE_2D);
     m_mipmapHasBeenAllocated = true;
     m_needsMipmapRegeneration = false;
+}
+
+void KisTextureTile::updateFromGpuBuffer(const KisGpuBrush::PresentationTile &source, const QRect &imageBounds)
+{
+    const QRect sourceRect(source.x,source.y,source.width,source.height);
+    const QRect patch=sourceRect & m_textureRectInImagePixels & imageBounds;
+    if (patch.isEmpty()) return;
+    GLint oldBuffer=0,oldTexture=0,oldRowLength=0,oldAlignment=0;
+    f->glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING,&oldBuffer);
+    f->glGetIntegerv(GL_TEXTURE_BINDING_2D,&oldTexture);
+    f->glGetIntegerv(GL_UNPACK_ROW_LENGTH,&oldRowLength);
+    f->glGetIntegerv(GL_UNPACK_ALIGNMENT,&oldAlignment);
+    f->glBindBuffer(GL_PIXEL_UNPACK_BUFFER,source.buffer);
+    f->glBindTexture(GL_TEXTURE_2D,m_textureId);
+    f->glPixelStorei(GL_UNPACK_ROW_LENGTH,source.width);
+    f->glPixelStorei(GL_UNPACK_ALIGNMENT,1);
+    const auto words=KisGpuBrush::wordsPerPixel(source.format);
+    const auto upload=[&](const QRect &destination,const QPoint &from) {
+        const auto offset=source.byteOffset+std::uint64_t((from.y()-source.y)*source.width+from.x()-source.x)*words*4;
+        const QPoint dst=destination.topLeft()-m_textureRectInImagePixels.topLeft();
+        f->glTexSubImage2D(GL_TEXTURE_2D,0,dst.x(),dst.y(),destination.width(),destination.height(),
+            m_texturesInfo->format,m_texturesInfo->type,reinterpret_cast<const void *>(std::uintptr_t(offset)));
+    };
+    upload(patch,patch.topLeft());
+    // Match the CPU texture uploader's replicated image-edge padding. The
+    // clean part of a resident cell can extend beyond the document bounds.
+    QVector<int> outerX,outerY;
+    for (int x=m_textureRectInImagePixels.left();x<=m_textureRectInImagePixels.right();++x)
+        if (x<imageBounds.left() || x>imageBounds.right()) outerX.append(x);
+    for (int y=m_textureRectInImagePixels.top();y<=m_textureRectInImagePixels.bottom();++y)
+        if (y<imageBounds.top() || y>imageBounds.bottom()) outerY.append(y);
+    for (const int x:outerX) {
+        const int sx=qBound(imageBounds.left(),x,imageBounds.right());
+        if (sourceRect.contains(QPoint(sx,patch.top())))
+            upload(QRect(x,patch.top(),1,patch.height()),QPoint(sx,patch.top()));
+    }
+    for (const int y:outerY) {
+        const int sy=qBound(imageBounds.top(),y,imageBounds.bottom());
+        if (sourceRect.contains(QPoint(patch.left(),sy)))
+            upload(QRect(patch.left(),y,patch.width(),1),QPoint(patch.left(),sy));
+        for (const int x:outerX) {
+            const QPoint from(qBound(imageBounds.left(),x,imageBounds.right()),sy);
+            if (sourceRect.contains(from)) upload(QRect(x,y,1,1),from);
+        }
+    }
+    f->glPixelStorei(GL_UNPACK_ROW_LENGTH,oldRowLength);
+    f->glPixelStorei(GL_UNPACK_ALIGNMENT,oldAlignment);
+    f->glBindBuffer(GL_PIXEL_UNPACK_BUFFER,oldBuffer);
+    f->glBindTexture(GL_TEXTURE_2D,oldTexture);
+    setNeedsMipmapRegeneration();
 }
 
 void KisTextureTile::update(const KisTextureTileUpdateInfo &updateInfo, bool blockMipmapRegeneration)

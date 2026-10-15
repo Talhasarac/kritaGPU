@@ -14,8 +14,19 @@
 #include <QRect>
 #include <QImage>
 #include "KisOptimizedByteArray.h"
+#include "gpu/KisGpuBrushCompositor.h"
+#include <functional>
+#include <memory>
+#include <mutex>
 
 class KoColor;
+class KisFixedPaintDevice;
+struct KisDeferredGpuDab {
+    KisGpuBrush::Dab description;
+    std::shared_ptr<const std::vector<std::uint32_t>> source;
+    std::shared_ptr<const std::vector<std::uint32_t>> pattern;
+    std::function<void(KisFixedPaintDevice *)> generateCpu;
+};
 
 
 /**
@@ -109,6 +120,8 @@ public:
     const quint8* constData() const;
 
     quint8* data() const;
+    void setDeferredGpuDab(std::shared_ptr<KisDeferredGpuDab> dab);
+    std::shared_ptr<const KisDeferredGpuDab> deferredGpuDab() const;
 
     /**
      * Read the bytes representing the rectangle described by x, y, w, h into
@@ -199,6 +212,10 @@ public:
     void mirror(bool horizontal, bool vertical);
 
 private:
+    void materializeGpuDab() const;
+    mutable std::recursive_mutex m_gpuMutex;
+    mutable std::shared_ptr<KisDeferredGpuDab> m_gpuDab;
+    mutable bool m_gpuMaterialized = false;
 
     const KoColorSpace* m_colorSpace;
     QRect m_bounds;

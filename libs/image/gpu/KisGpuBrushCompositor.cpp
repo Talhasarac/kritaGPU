@@ -22,6 +22,9 @@
 #include <stdexcept>
 #include <thread>
 #include <tuple>
+#ifndef KRITA_GPU_BRUSH_STANDALONE
+#include <QCoreApplication>
+#endif
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -39,13 +42,21 @@ namespace KisGpuBrush
 namespace
 {
 constexpr std::size_t maxBufferBytes = 128u * 1024u * 1024u;
+#ifdef _WIN32
+std::mutex nativeConfigMutex;
+HGLRC nativeShareContext = nullptr;
+int nativePixelFormat = 0;
+int nativeProfile=1;
+int nativeReset=0x8261;
+#endif
 
 bool validBatch(const Batch &b)
 {
+    const auto words = wordsPerPixel(b.format);
+    if (int(b.format) < 0 || int(b.format) > 3 || b.pixels.size() % words || b.sourcePixels.size() % words) return false;
     if (b.tiles.empty() || b.dabs.empty() || b.dabIndices.empty() || b.pixels.empty() ||
-        (!b.selection.empty() && b.selection.size() != b.pixels.size()) || b.channelFlags > 15 ||
-        int(b.mode) < 0 || int(b.mode) > 3) return false;
-    if (b.mode != BlendMode::Over && b.channelFlags != 15) return false;
+        (!b.selection.empty() && b.selection.size() != b.pixels.size() / words) || b.channelFlags > 15 ||
+        int(b.mode) < 0 || int(b.mode) > int(BlendMode::LinearBurn)) return false;
     if (b.pixels.size() > maxBufferBytes / 4 ||
         b.sourcePixels.size() > maxBufferBytes / 4 ||
         b.dabs.size() > maxBufferBytes / sizeof(Dab) ||
@@ -54,19 +65,31 @@ bool validBatch(const Batch &b)
     for (const auto &d : b.dabs) {
         if (d.bounds[2] <= 0 || d.bounds[3] <= 0) return false;
         const auto area = std::uint64_t(d.bounds[2]) * d.bounds[3];
-        if (area + d.data[0] > b.sourcePixels.size()) return false;
+        if (d.data[1] == 0 && (area * words + d.data[0] > b.sourcePixels.size() || d.data[0] % words)) return false;
+        if (d.data[1] > 6 || d.data[1] == 4 || d.data[3] > 3) return false;
+        if (d.data[1]==6 && (d.data[2]<2 || std::uint64_t(d.data[0])+d.data[2]>b.sourcePixels.size())) return false;
+        if ((d.data[1] == 2 || d.data[1] == 3) && (!d.data[2] || d.data[2]>8192 || !std::isfinite(d.params[3]) || d.params[3] < 1 ||
+            d.params[3] > 8192 || std::uint64_t(d.data[2]) * std::uint64_t(d.params[3]) *
+                (d.data[1] == 3 ? words : 1) + d.data[0] > b.sourcePixels.size())) return false;
+        if (d.data[1] == 5 && (d.data[0] + area*words > b.sourcePixels.size() ||
+            d.texture[0] + area*words > b.sourcePixels.size() || d.texture[1]+area > b.sourcePixels.size())) return false;
+        if (d.data[1] != 5 && d.texture[1] && (std::uint64_t(d.texture[1]) * d.texture[2] + d.texture[0] > b.sourcePixels.size())) return false;
         if (std::int64_t(d.bounds[0]) + d.bounds[2] > std::numeric_limits<std::int32_t>::max() ||
             std::int64_t(d.bounds[1]) + d.bounds[3] > std::numeric_limits<std::int32_t>::max()) return false;
         for (int i = 0; i < 3; ++i) {
             if (!std::isfinite(d.params[i]) || d.params[i] < 0 || d.params[i] > 1) return false;
+        }
+        if (d.data[1]) for (int i=0;i<4;++i) {
+            if (!std::isfinite(d.shape[i]) || !std::isfinite(d.transform[i]) ||
+                !std::isfinite(d.colour[i]) || !std::isfinite(d.textureParams[i])) return false;
         }
     }
     std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
     for (const auto &t : b.tiles) {
         if (t.width <= 0 || t.height <= 0 || t.width > 512 || t.height > 512 ||
             !t.dabCount || t.dabCount > 4096) return false;
-        const auto end = std::uint64_t(t.pixelOffset) + std::uint64_t(t.width) * t.height;
-        if (end > b.pixels.size() ||
+        const auto end = std::uint64_t(t.pixelOffset) + std::uint64_t(t.width) * t.height * words;
+        if (end > b.pixels.size() || t.pixelOffset % words ||
             std::uint64_t(t.indexOffset) + t.dabCount > b.dabIndices.size()) return false;
         if (std::int64_t(t.x) + t.width > std::numeric_limits<std::int32_t>::max() ||
             std::int64_t(t.y) + t.height > std::numeric_limits<std::int32_t>::max()) return false;
@@ -90,6 +113,7 @@ constexpr GLenum infoLogLength = 0x8B84;
 constexpr GLenum maxShaderStorageBlockSize = 0x90DE;
 constexpr GLbitfield storageBarrier = 0x2000;
 constexpr GLbitfield bufferUpdateBarrier = 0x0200;
+constexpr GLbitfield pixelBufferBarrier = 0x0080;
 constexpr GLenum syncGpuCommandsComplete = 0x9117;
 constexpr GLenum alreadySignaled = 0x911A;
 constexpr GLenum conditionSatisfied = 0x911C;
@@ -167,6 +191,8 @@ class GlWorker
 {
 public:
     bool available = false;
+    bool sharedCanvas = false;
+    std::vector<void *> consumerFences;
     std::string message, renderer;
 
     void initialize()
@@ -189,7 +215,12 @@ public:
             pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL;
             pfd.iPixelType = PFD_TYPE_RGBA;
             pfd.cColorBits = 32;
-            const int format = ChoosePixelFormat(m_dc, &pfd);
+            HGLRC share;
+            int format,profile,reset;
+            { std::lock_guard<std::mutex> lock(nativeConfigMutex); share=nativeShareContext; format=nativePixelFormat;
+                profile=nativeProfile; reset=nativeReset; }
+            if (!format) format=ChoosePixelFormat(m_dc,&pfd);
+            else DescribePixelFormat(m_dc,format,sizeof(pfd),&pfd);
             if (!format || !SetPixelFormat(m_dc, format, &pfd)) {
                 throw std::runtime_error("Cannot set GPU brush pixel format");
             }
@@ -200,8 +231,12 @@ public:
             using CreateContext = HGLRC (WINAPI *)(HDC, HGLRC, const int *);
             CreateContext createContext = nullptr;
             GlFunctions::resolve(createContext, "wglCreateContextAttribsARB");
-            const int attributes[] = {0x2091, 4, 0x2092, 3, 0x9126, 1, 0};
-            HGLRC modern = createContext(m_dc, nullptr, attributes);
+            const int attributes[] = {0x2091, 4, 0x2092, 3, 0x9126, share ? profile : 1,
+                0x8256,share ? reset : 0x8261,0};
+            HGLRC modern = createContext(m_dc, share, attributes);
+            const DWORD shareError=modern || !share ? 0 : GetLastError();
+            sharedCanvas=modern && share;
+            if (!modern && share) modern=createContext(m_dc,nullptr,attributes);
             if (!modern) throw std::runtime_error("GPU brushes require native OpenGL 4.3");
             wglMakeCurrent(nullptr, nullptr);
             wglDeleteContext(m_context);
@@ -234,6 +269,7 @@ public:
             if (glGetError() != GL_NO_ERROR) throw std::runtime_error("Cannot allocate compute buffers");
             available = true;
             message = "OpenGL compute brush compositor ready: " + renderer;
+            if (shareError) message += "; canvas sharing failed with WGL error " + std::to_string(shareError);
         } catch (const std::exception &e) {
             message = e.what();
         }
@@ -259,11 +295,17 @@ public:
         if (!available) { result.message = message; return result; }
         bool debugGroup = false;
         try {
+            waitForConsumers();
             while (glGetError() != GL_NO_ERROR) {}
             std::vector<std::uint32_t> output(batch.pixels.size());
             m_gl.PushDebugGroup(0x824A, 0, -1, "Krita GPU Pixel Brush batch");
             debugGroup = true;
             const bool resident = prepareResidentTiles(batch, result);
+            if (batch.deferReadback && (!resident || !sharedCanvas)) {
+                m_gl.PopDebugGroup();
+                result.message="GPU stroke needs a CPU checkpoint before continuing";
+                return result;
+            }
             if (resident) {
                 // This buffer is a compact dirty-pixel transfer surface. It
                 // receives CPU data only for cache misses; the compositor
@@ -274,7 +316,7 @@ public:
                     if (!m_prepared[i].initialize) continue;
                     const Tile &t = batch.tiles[i];
                     if (batch.loadPixels) batch.loadPixels(t, output.data() + t.pixelOffset);
-                    const auto bytes = std::size_t(t.width) * t.height * 4;
+                    const auto bytes = std::size_t(t.width) * t.height * wordsPerPixel(batch.format) * 4;
                     m_gl.BufferSubData(shaderStorageBuffer, std::ptrdiff_t(t.pixelOffset) * 4,
                                        std::ptrdiff_t(bytes),
                                        (batch.loadPixels ? output.data() : batch.pixels.data()) + t.pixelOffset);
@@ -302,6 +344,7 @@ public:
             checkError("uploading brush buffers");
             m_gl.UseProgram(m_program);
             m_gl.Uniform1i(m_modeLocation, int(batch.mode));
+            m_gl.Uniform1i(m_formatLocation, int(batch.format));
             m_gl.Uniform1i(m_selectionLocation, batch.selection.empty() ? 0 : 1);
             for (std::size_t i = 0; i < batch.tiles.size(); ++i) {
                 const Tile &t = batch.tiles[i];
@@ -311,7 +354,8 @@ public:
                 for (unsigned first = 0; first < t.dabCount; first += 256) {
                     if (resident) {
                         m_gl.Uniform4ui(m_residencyLocation, m_prepared[i].offset,
-                                        residentTileSize, 1, first == 0 && m_prepared[i].initialize ? 1 : 0);
+                                        residentTileSize * wordsPerPixel(batch.format), 1,
+                                        first == 0 && m_prepared[i].initialize ? 1 : 0);
                     } else {
                         m_gl.Uniform4ui(m_residencyLocation, 0, 0, 0, 0);
                     }
@@ -323,7 +367,7 @@ public:
                     if (first + count < t.dabCount) m_gl.MemoryBarrier(storageBarrier);
                 }
             }
-            m_gl.MemoryBarrier(storageBarrier | bufferUpdateBarrier);
+            m_gl.MemoryBarrier(storageBarrier | bufferUpdateBarrier | pixelBufferBarrier);
             m_gl.PopDebugGroup();
             debugGroup = false;
             checkError("dispatching brush compute");
@@ -339,6 +383,14 @@ public:
             } while (std::chrono::steady_clock::now() < deadline);
             m_gl.DeleteSync(fence);
             if (!completed) throw std::runtime_error("GPU brush fence failed or timed out");
+            if (batch.deferReadback) {
+                for (auto &tile : m_prepared) {
+                    tile.entry->pinned=true;
+                    tile.entry->presentationKey=batch.presentationKey;
+                }
+                result.success=true;
+                return result;
+            }
             m_gl.BindBuffer(shaderStorageBuffer, m_buffers[0]);
             m_gl.GetBufferSubData(shaderStorageBuffer, 0,
                                  std::ptrdiff_t(output.size() * 4), output.data());
@@ -358,15 +410,70 @@ public:
         return result;
     }
 
+    std::vector<PresentationTile> presentation(std::uint64_t key) const
+    {
+        std::vector<PresentationTile> tiles;
+        for (const auto &entry:m_resident) {
+            if (!entry.second.pinned || entry.second.presentationKey!=key) continue;
+            tiles.push_back({std::get<2>(entry.first),std::get<3>(entry.first),residentTileSize,residentTileSize,
+                m_buffers[5],entry.second.slot*slotWords*4,entry.second.age,PixelFormat(std::get<4>(entry.first))});
+        }
+        return tiles;
+    }
+    Checkpoint checkpoint(std::uint64_t id,std::uint64_t generation)
+    {
+        Checkpoint result;
+        try {
+            waitForConsumers();
+            m_gl.BindBuffer(shaderStorageBuffer,m_buffers[5]);
+            for (auto &entry:m_resident) {
+                if (!entry.second.pinned || std::get<0>(entry.first)!=id || std::get<1>(entry.first)!=generation) continue;
+                result.format=PixelFormat(std::get<4>(entry.first));
+                const auto count=cellPixels*wordsPerPixel(result.format);
+                Tile tile;
+                tile.x=std::get<2>(entry.first); tile.y=std::get<3>(entry.first);
+                tile.width=tile.height=residentTileSize;
+                tile.pixelOffset=result.pixels.size();
+                result.pixels.resize(result.pixels.size()+count);
+                m_gl.GetBufferSubData(shaderStorageBuffer,entry.second.slot*slotWords*4,count*4,
+                    result.pixels.data()+tile.pixelOffset);
+                result.tiles.push_back(tile);
+            }
+            checkError("checkpointing GPU stroke");
+            for (auto &entry:m_resident) if (std::get<0>(entry.first)==id && std::get<1>(entry.first)==generation) {
+                entry.second.pinned=false; entry.second.presentationKey=0;
+            }
+            result.success=true;
+        } catch (const std::exception &error) { result.message=error.what(); }
+        return result;
+    }
+    void discard(std::uint64_t id)
+    {
+        for (auto &entry:m_resident) if (std::get<0>(entry.first)==id) {
+            entry.second.pinned=false; entry.second.presentationKey=0; entry.second.fullyLoaded=false;
+            std::fill(entry.second.valid.begin(),entry.second.valid.end(),0);
+        }
+    }
+    void restartSharing()
+    {
+        if (sharedCanvas) return;
+        this->~GlWorker();
+        new(this) GlWorker;
+        initialize();
+    }
+
 private:
-    static constexpr unsigned maxResidentTiles = 256;
+    static constexpr unsigned maxResidentTiles = 64;
     static constexpr std::size_t cellPixels = residentTileSize * residentTileSize;
-    using CacheKey = std::tuple<std::uint64_t, std::uint64_t, std::int32_t, std::int32_t>;
+    static constexpr std::size_t slotWords = cellPixels * 4;
+    using CacheKey = std::tuple<std::uint64_t, std::uint64_t, std::int32_t, std::int32_t, int>;
     struct ResidentTile {
         unsigned slot = 0;
         std::uint64_t age = 0;
         std::uint64_t loadedAge = 0;
         bool fullyLoaded = false;
+        bool pinned=false;
+        std::uint64_t presentationKey=0;
         std::vector<std::uint32_t> shadow;
         std::vector<unsigned char> valid;
     };
@@ -385,14 +492,19 @@ private:
     {
         m_prepared.clear();
         if (!batch.cacheId || batch.tiles.size() > 1024) return false;
+        const auto words = wordsPerPixel(batch.format);
         std::set<CacheKey> keys;
         for (const Tile &t : batch.tiles) {
             const auto x = cellOrigin(t.x), y = cellOrigin(t.y);
             if (std::int64_t(t.x) + t.width > std::int64_t(x) + residentTileSize ||
                 std::int64_t(t.y) + t.height > std::int64_t(y) + residentTileSize) return false;
-            keys.emplace(batch.cacheId, batch.cacheGeneration, x, y);
+            keys.emplace(batch.cacheId, batch.cacheGeneration, x, y, int(batch.format));
         }
         if (keys.size() > maxResidentTiles) return false;
+        std::size_t missing=0, reusable=maxResidentTiles-m_resident.size();
+        for (const auto &key:keys) if (!m_resident.count(key)) ++missing;
+        for (const auto &entry:m_resident) if (!entry.second.pinned && !keys.count(entry.first)) ++reusable;
+        if (missing>reusable) return false;
         // Reject intersecting world-space output too. Packed-buffer validation
         // alone cannot protect an atlas from two dispatches sharing pixels.
         for (std::size_t i = 0; i < batch.tiles.size(); ++i) {
@@ -405,7 +517,7 @@ private:
                     std::int64_t(b.y) < std::int64_t(a.y) + a.height) return false;
             }
         }
-        if (!m_capacity[5]) reserve(5, maxResidentTiles * cellPixels * 4);
+        if (!m_capacity[5]) reserve(5, maxResidentTiles * slotWords * 4);
         ++m_cacheAge;
         // Pin all entries needed by this batch before evicting any old entry.
         for (const auto &key : keys) {
@@ -418,7 +530,7 @@ private:
             if (m_resident.size() == maxResidentTiles) {
                 auto oldest = m_resident.end();
                 for (auto it = m_resident.begin(); it != m_resident.end(); ++it) {
-                    if (it->second.age != m_cacheAge &&
+                    if (!it->second.pinned && it->second.age != m_cacheAge &&
                         (oldest == m_resident.end() || it->second.age < oldest->second.age)) oldest = it;
                 }
                 if (oldest == m_resident.end()) return false;
@@ -428,7 +540,7 @@ private:
             ResidentTile entry;
             entry.slot = slot;
             entry.age = m_cacheAge;
-            if (!batch.loadPixels) entry.shadow.resize(cellPixels);
+            if (!batch.loadPixels) entry.shadow.resize(cellPixels * words);
             entry.valid.resize(cellPixels, 0);
             m_resident.emplace(key, std::move(entry));
         }
@@ -440,15 +552,15 @@ private:
             for (const auto &key : keys) {
                 auto &entry = m_resident.at(key);
                 if (entry.fullyLoaded) continue;
-                initial.resize(cellPixels);
+                initial.resize(cellPixels * words);
                 Tile cell;
                 cell.x = std::get<2>(key); cell.y = std::get<3>(key);
                 cell.width = cell.height = residentTileSize;
                 batch.loadPixels(cell, initial.data());
                 m_gl.BindBuffer(shaderStorageBuffer, m_buffers[5]);
-                m_gl.BufferSubData(shaderStorageBuffer, std::ptrdiff_t(entry.slot * cellPixels * 4),
-                                   std::ptrdiff_t(cellPixels * 4), initial.data());
-                result.destinationUploadedBytes += cellPixels * 4;
+                m_gl.BufferSubData(shaderStorageBuffer, std::ptrdiff_t(entry.slot * slotWords * 4),
+                                   std::ptrdiff_t(cellPixels * words * 4), initial.data());
+                result.destinationUploadedBytes += cellPixels * words * 4;
                 entry.fullyLoaded = true;
                 entry.loadedAge = m_cacheAge;
                 std::fill(entry.valid.begin(), entry.valid.end(), 1);
@@ -456,18 +568,18 @@ private:
         }
         for (const Tile &t : batch.tiles) {
             const auto x = cellOrigin(t.x), y = cellOrigin(t.y);
-            auto &entry = m_resident.at(CacheKey(batch.cacheId, batch.cacheGeneration, x, y));
+            auto &entry = m_resident.at(CacheKey(batch.cacheId, batch.cacheGeneration, x, y, int(batch.format)));
             const auto local = std::uint32_t((t.y - y) * residentTileSize + t.x - x);
             bool unchanged = true;
             for (int row = 0; !batch.loadPixels && row < t.height && unchanged; ++row) {
                 const auto pos = local + row * residentTileSize;
                 unchanged = std::all_of(entry.valid.begin() + pos, entry.valid.begin() + pos + t.width,
                                         [](unsigned char valid) { return valid != 0; });
-                unchanged = unchanged && entry.shadow.size() == cellPixels &&
-                    std::memcmp(entry.shadow.data() + pos,
-                                batch.pixels.data() + t.pixelOffset + row * t.width, t.width * 4) == 0;
+                unchanged = unchanged && entry.shadow.size() == cellPixels * words &&
+                    std::memcmp(entry.shadow.data() + pos * words,
+                                batch.pixels.data() + t.pixelOffset + row * t.width * words, t.width * words * 4) == 0;
             }
-            m_prepared.push_back({&entry, std::uint32_t(entry.slot * cellPixels + local), !unchanged,
+            m_prepared.push_back({&entry, std::uint32_t(entry.slot * slotWords + local * words), !unchanged,
                                   unchanged && (!batch.loadPixels || entry.loadedAge != m_cacheAge)});
         }
         return true;
@@ -475,15 +587,16 @@ private:
     void rememberResidentPixels(const Batch &batch, const std::vector<std::uint32_t> &output)
     {
         if (batch.loadPixels) return;
+        const auto words = wordsPerPixel(batch.format);
         for (std::size_t i = 0; i < batch.tiles.size(); ++i) {
             const auto &t = batch.tiles[i];
             auto &entry = *m_prepared[i].entry;
-            if (entry.shadow.empty()) entry.shadow.resize(cellPixels);
-            const auto local = m_prepared[i].offset - entry.slot * cellPixels;
+            if (entry.shadow.empty()) entry.shadow.resize(cellPixels * words);
+            const auto local = (m_prepared[i].offset - entry.slot * slotWords) / words;
             for (int row = 0; row < t.height; ++row) {
                 const auto pos = local + row * residentTileSize;
-                std::memcpy(entry.shadow.data() + pos,
-                            output.data() + t.pixelOffset + row * t.width, t.width * 4);
+                std::memcpy(entry.shadow.data() + pos * words,
+                            output.data() + t.pixelOffset + row * t.width * words, t.width * words * 4);
                 std::fill_n(entry.valid.begin() + pos, t.width, 1);
             }
         }
@@ -494,6 +607,19 @@ private:
         if (error != GL_NO_ERROR) {
             throw std::runtime_error(std::string("OpenGL error ") + std::to_string(error) + " while " + operation);
         }
+    }
+    void waitForConsumers()
+    {
+        bool completed=true;
+        for (void *fence:consumerFences) {
+            const auto status=m_gl.ClientWaitSync(fence,0,2000000000ull);
+            m_gl.DeleteSync(fence);
+            if (status!=alreadySignaled && status!=conditionSatisfied) {
+                completed=false;
+            }
+        }
+        consumerFences.clear();
+        if (!completed) throw std::runtime_error("Canvas GPU synchronization failed");
     }
     void compile()
     {
@@ -527,8 +653,9 @@ private:
         m_rangesLocation = m_gl.GetUniformLocation(m_program, "ranges");
         m_residencyLocation = m_gl.GetUniformLocation(m_program, "residency");
         m_selectionLocation = m_gl.GetUniformLocation(m_program, "hasSelection");
+        m_formatLocation = m_gl.GetUniformLocation(m_program, "pixelFormat");
         if (m_modeLocation < 0 || m_tileLocation < 0 || m_rangesLocation < 0 ||
-            m_residencyLocation < 0 || m_selectionLocation < 0) {
+            m_residencyLocation < 0 || m_selectionLocation < 0 || m_formatLocation < 0) {
             throw std::runtime_error("GPU brush shader uniforms are missing");
         }
     }
@@ -575,6 +702,7 @@ private:
     std::int64_t m_maxBufferSize = 0;
     GLint m_modeLocation = -1, m_tileLocation = -1, m_rangesLocation = -1;
     GLint m_residencyLocation = -1, m_selectionLocation = -1;
+    GLint m_formatLocation = -1;
 };
 #else
 class GlWorker
@@ -583,14 +711,24 @@ public:
     bool available = false;
     std::string message = "GPU brush compositing is currently supported on Windows only";
     std::string renderer;
+    bool sharedCanvas=false;
+    std::vector<void *> consumerFences;
     void initialize() {}
     Result render(Batch &) { return {false, message, renderer, 0}; }
+    std::vector<PresentationTile> presentation(std::uint64_t) const { return {}; }
+    Checkpoint checkpoint(std::uint64_t,std::uint64_t) { return {}; }
+    void discard(std::uint64_t) {}
+    void restartSharing() {}
 };
 #endif
 }
 
 struct Compositor::Private
 {
+    std::mutex presentationMutex;
+    GlWorker *workerPointer=nullptr;
+    struct Canvas { std::uint64_t token; std::function<void()> repaint; };
+    std::map<std::uint64_t,Canvas> canvases;
     std::mutex mutex;
     std::condition_variable wake;
     std::deque<std::function<void(GlWorker &)>> work;
@@ -601,6 +739,7 @@ struct Compositor::Private
         : thread([this] {
             GlWorker worker;
             worker.initialize();
+            { std::lock_guard<std::mutex> lock(presentationMutex); workerPointer=&worker; }
             for (;;) {
                 std::function<void(GlWorker &)> job;
                 {
@@ -610,8 +749,9 @@ struct Compositor::Private
                     job = std::move(work.front());
                     work.pop_front();
                 }
-                job(worker);
+                { std::lock_guard<std::mutex> lock(presentationMutex); job(worker); }
             }
+            { std::lock_guard<std::mutex> lock(presentationMutex); workerPointer=nullptr; }
         })
     {
     }
@@ -644,7 +784,14 @@ Compositor &Compositor::instance()
     static Compositor compositor;
     return compositor;
 }
-Compositor::Compositor() : m_d(new Private) {}
+Compositor::Compositor() : m_d(new Private)
+{
+#ifndef KRITA_GPU_BRUSH_STANDALONE
+    if (auto *app = QCoreApplication::instance()) {
+        QObject::connect(app, &QCoreApplication::aboutToQuit, app, [this] { shutdown(); }, Qt::DirectConnection);
+    }
+#endif
+}
 Compositor::~Compositor() = default;
 bool Compositor::isAvailable()
 {
@@ -663,7 +810,81 @@ Result Compositor::render(Batch &batch)
 {
     if (!validBatch(batch)) return {false, "Invalid or oversized GPU brush batch", {}, 0};
     try {
-        return m_d->submit<Result>([&batch](GlWorker &worker) { return worker.render(batch); });
+        return m_d->submit<Result>([&batch,this](GlWorker &worker) {
+            if (batch.deferReadback && !m_d->canvases.count(batch.presentationKey)) batch.deferReadback=false;
+            auto result=worker.render(batch);
+            if (result.success && batch.deferReadback) {
+                const auto canvas=m_d->canvases.find(batch.presentationKey);
+                if (canvas!=m_d->canvases.end()) canvas->second.repaint();
+            }
+            return result;
+        });
     } catch (const std::exception &e) { return {false, e.what(), {}, 0}; }
+}
+
+void Compositor::configureNativeCanvas(void *context,void *dc)
+{
+#ifdef _WIN32
+    if (!context || !dc) return;
+    { std::lock_guard<std::mutex> lock(nativeConfigMutex);
+        nativeShareContext=static_cast<HGLRC>(context);
+        nativePixelFormat=GetPixelFormat(static_cast<HDC>(dc));
+        glGetIntegerv(0x9126,&nativeProfile);
+        glGetIntegerv(0x8256,&nativeReset);
+        if (nativeProfile!=1 && nativeProfile!=2) nativeProfile=1;
+        if (nativeReset!=0x8252) nativeReset=0x8261;
+    }
+    // Some WGL drivers reject sharing while the source context is current
+    // on another thread. Qt is idle during this synchronous handoff.
+    const HGLRC previousContext=wglGetCurrentContext();
+    const HDC previousDc=wglGetCurrentDC();
+    if (previousContext) wglMakeCurrent(nullptr,nullptr);
+    try { m_d->submit<bool>([](GlWorker &worker) { worker.restartSharing(); return worker.sharedCanvas; }); }
+    catch (const std::exception &) {}
+    if (previousContext) wglMakeCurrent(previousDc,previousContext);
+#else
+    (void)context; (void)dc;
+#endif
+}
+void Compositor::registerCanvas(std::uint64_t key,std::uint64_t token,std::function<void()> repaint)
+{
+    std::lock_guard<std::mutex> lock(m_d->presentationMutex);
+    m_d->canvases[key]={token,std::move(repaint)};
+}
+void Compositor::unregisterCanvas(std::uint64_t key,std::uint64_t token)
+{
+    std::lock_guard<std::mutex> lock(m_d->presentationMutex);
+    const auto it=m_d->canvases.find(key);
+    if (it!=m_d->canvases.end() && it->second.token==token) m_d->canvases.erase(it);
+}
+bool Compositor::canPresent(std::uint64_t key)
+{
+    std::lock_guard<std::mutex> lock(m_d->presentationMutex);
+    return m_d->workerPointer && m_d->workerPointer->available && m_d->workerPointer->sharedCanvas && m_d->canvases.count(key);
+}
+bool Compositor::hasPresentation(std::uint64_t key)
+{
+    std::lock_guard<std::mutex> lock(m_d->presentationMutex);
+    return m_d->workerPointer && !m_d->workerPointer->presentation(key).empty();
+}
+bool Compositor::present(std::uint64_t key,const std::function<void *(const std::vector<PresentationTile> &)> &draw)
+{
+    std::lock_guard<std::mutex> lock(m_d->presentationMutex);
+    auto *worker=m_d->workerPointer;
+    if (!worker || !worker->sharedCanvas) return false;
+    auto tiles=worker->presentation(key);
+    if (tiles.empty()) return false;
+    if (auto *fence=draw(tiles)) worker->consumerFences.push_back(fence);
+    return true;
+}
+Checkpoint Compositor::checkpoint(std::uint64_t id,std::uint64_t generation)
+{
+    try { return m_d->submit<Checkpoint>([=](GlWorker &worker) { return worker.checkpoint(id,generation); }); }
+    catch (const std::exception &error) { Checkpoint result; result.message=error.what(); return result; }
+}
+void Compositor::discard(std::uint64_t id)
+{
+    try { m_d->submit<bool>([=](GlWorker &worker) { worker.discard(id); return true; }); }
+    catch (const std::exception &) {}
 }
 }

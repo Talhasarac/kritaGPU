@@ -5,7 +5,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(Threads REQUIRED)
 add_executable(krita_gpu_brush_compute_test
     KisGpuBrushComputeTest.cpp
-    ../KisGpuBrushCompositor.cpp)
+    ../../../../../../libs/image/gpu/KisGpuBrushCompositor.cpp)
+target_include_directories(krita_gpu_brush_compute_test PRIVATE ../../../../../../libs/image)
+target_compile_definitions(krita_gpu_brush_compute_test PRIVATE KRITA_GPU_BRUSH_STANDALONE)
 target_link_libraries(krita_gpu_brush_compute_test PRIVATE Threads::Threads)
 if(WIN32)
     target_sources(krita_gpu_brush_compute_test PRIVATE ../../../../../../krita/windows_gpu_preference.cpp)

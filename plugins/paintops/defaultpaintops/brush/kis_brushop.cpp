@@ -43,6 +43,10 @@
 #include "kis_image_config.h"
 #include "kis_wrapped_rect.h"
 #include "gpu/KisGpuBrushPaint.h"
+#include "gpu/KisGpuBrushCompositor.h"
+#include <kis_group_layer.h>
+#include <kis_node.h>
+#include <KoCompositeOpRegistry.h>
 
 
 KisBrushOp::KisBrushOp(const KisPaintOpSettingsSP settings, KisPainter *painter, KisNodeSP node, KisImageSP image)
@@ -96,7 +100,16 @@ KisBrushOp::KisBrushOp(const KisPaintOpSettingsSP settings, KisPainter *painter,
                     painter->runnableStrokeJobsInterface(),
                     &m_mirrorOption,
                     &m_precisionOption));
-    if (m_useGpuBrushCompositing) m_gpuSession.reset(new KisGpuBrushPaint::Session);
+    if (m_useGpuBrushCompositing) {
+        m_gpuSession.reset(new KisGpuBrushPaint::Session);
+        auto *layer=dynamic_cast<KisLayer *>(node.data());
+        if (image && layer && !layer->layerStyle() && layer->projection()==painter->device() &&
+            node->paintDevice()==painter->device() &&
+            image->rootLayer()->childCount()==1 && node->childCount()==0 && node->opacity()==255 &&
+            node->compositeOpId()==COMPOSITE_OVER && painter->device()->defaultBounds()->currentLevelOfDetail()==0) {
+            m_gpuSession->setPresentationKey(reinterpret_cast<std::uintptr_t>(image.data()));
+        }
+    }
 }
 
 KisBrushOp::~KisBrushOp()
@@ -182,6 +195,10 @@ void KisBrushOp::addDabRenderingJobs(const QVector<QRect> &rects,
             }
         });
     } else {
+        if (m_gpuSession) {
+            const auto session=m_gpuSession;
+            KritaUtils::addJobSequential(jobs,[session] { session->flush(); });
+        }
         for (const QRect &rect : rects) {
             KritaUtils::addJobConcurrent(jobs, [rect, state] {
                 state->painter->bltFixed(rect, state->dabsQueue);
@@ -407,6 +424,7 @@ KisTimingInformation KisBrushOp::updateTimingImpl(const KisPaintInformation &inf
 void KisBrushOp::paintLine(const KisPaintInformation& pi1, const KisPaintInformation& pi2, KisDistanceInformation *currentDistance)
 {
     if (m_sharpnessOption.isChecked() && m_brush && (m_brush->width() == 1) && (m_brush->height() == 1)) {
+        if (m_gpuSession) m_gpuSession->flush();
 
         if (!m_lineCacheDevice) {
             m_lineCacheDevice = source()->createCompositionSourceDevice();

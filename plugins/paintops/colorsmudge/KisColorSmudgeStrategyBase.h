@@ -8,11 +8,13 @@
 #define KRITA_KISCOLORSMUDGESTRATEGYBASE_H
 
 #include <kis_types.h>
+#include <memory>
 
 #include "KisColorSmudgeStrategy.h"
 #include "KisColorSmudgeSource.h"
 
 class KisPainter;
+namespace KisGpuBrushPaint { class Session; }
 
 
 class KisColorSmudgeStrategyBase : public KisColorSmudgeStrategy
@@ -121,6 +123,7 @@ protected:
 private:
     KisFixedPaintDeviceSP m_blendDevice;
     bool m_useDullingMode {true};
+    std::shared_ptr<KisGpuBrushPaint::Session> m_gpuSession;
 };
 
 

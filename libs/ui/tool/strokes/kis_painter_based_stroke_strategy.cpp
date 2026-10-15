@@ -18,6 +18,7 @@
 #include <kis_distance_information.h>
 #include "kis_undo_stores.h"
 #include "KisFreehandStrokeInfo.h"
+#include <gpu/KisGpuBrushPaint.h>
 #include "KisMaskedFreehandStrokePainter.h"
 #include "KisMaskingBrushRenderer.h"
 #include "KisRunnableStrokeJobData.h"
@@ -388,6 +389,10 @@ struct MergeableStrokeUndoCommand : KUndo2Command
 
 void KisPainterBasedStrokeStrategy::finishStrokeCallback()
 {
+    for (const auto *info:m_strokeInfos) if (info->painter)
+        KisGpuBrushPaint::flushDevice(info->painter->device().data());
+    for (const auto *info:m_maskStrokeInfos) if (info->painter)
+        KisGpuBrushPaint::flushDevice(info->painter->device().data());
     KisNodeSP node = m_resources->currentNode();
     KisIndirectPaintingSupport *indirect =
         dynamic_cast<KisIndirectPaintingSupport*>(node.data());
@@ -470,6 +475,10 @@ void KisPainterBasedStrokeStrategy::finishStrokeCallback()
 
 void KisPainterBasedStrokeStrategy::cancelStrokeCallback()
 {
+    for (const auto *info:m_strokeInfos) if (info->painter)
+        KisGpuBrushPaint::discardDevice(info->painter->device().data());
+    for (const auto *info:m_maskStrokeInfos) if (info->painter)
+        KisGpuBrushPaint::discardDevice(info->painter->device().data());
     if (!m_transaction) return;
 
     if (m_autokeyCommand) {

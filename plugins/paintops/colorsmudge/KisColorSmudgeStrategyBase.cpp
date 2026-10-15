@@ -11,6 +11,8 @@
 #include "kis_fixed_paint_device.h"
 #include "kis_paint_device.h"
 #include "KisColorSmudgeSampleUtils.h"
+#include <gpu/KisGpuBrushPaint.h>
+#include <kis_image_config.h>
 
 /**********************************************************************************/
 /*                 DabColoringStrategyMask                                        */
@@ -112,6 +114,7 @@ void KisColorSmudgeStrategyBase::DabColoringStrategyStamp::blendInFusedBackgroun
 
 KisColorSmudgeStrategyBase::KisColorSmudgeStrategyBase(bool useDullingMode)
         : m_useDullingMode(useDullingMode)
+        , m_gpuSession(std::make_shared<KisGpuBrushPaint::Session>())
 {
 }
 
@@ -206,6 +209,26 @@ KisColorSmudgeStrategyBase::blendBrush(const QVector<KisPainter *> dstPainters, 
     DabColoringStrategy &coloringStrategy = this->coloringStrategy();
 
     const qreal dullingRateOpacity = this->dullingRateOpacity(opacity, smudgeRateValue);
+
+    if (KisImageConfig(true).useGpuBrushCompositing() && dstPainters.size()==1 &&
+        !dstPainters.first()->hasMirroring() &&
+        dynamic_cast<DabColoringStrategyMask *>(&coloringStrategy) &&
+        (qint64(dstRect.width())*dstRect.height()>=65536 || qEnvironmentVariableIsSet("KRITA_GPU_BRUSH_FORCE"))) {
+        KisFixedPaintDevice background(preciseColorSpace()), carried(preciseColorSpace());
+        background.setRect(dstRect); background.lazyGrowBufferWithoutInitialization();
+        srcSampleDevice->readBytes(background.data(),dstRect);
+        carried.setRect(srcRect); carried.lazyGrowBufferWithoutInitialization();
+        if (!m_useDullingMode) srcSampleDevice->readBytes(carried.data(),srcRect);
+        const bool fused=colorRateOpacity>0 && m_useDullingMode &&
+            ((m_smearOp->id()==COMPOSITE_OVER && m_colorRateOp->id()==COMPOSITE_OVER) ||
+             (m_smearOp->id()==COMPOSITE_COPY && qFuzzyCompare(dullingRateOpacity,OPACITY_OPAQUE_F)));
+        auto *dstPainter=dstPainters.first();
+        dstPainter->setOpacityF(finalPainterOpacity(opacity,smudgeRateValue));
+        if (KisGpuBrushPaint::trySmudge(dstPainter,dstRect,&background,&carried,maskDab.data(),
+                m_preparedDullingColor,currentPaintColor.convertedTo(preciseColorSpace()),m_useDullingMode,fused,
+                m_smearOp->id(),m_useDullingMode ? dullingRateOpacity : smearRateOpacity(opacity,smudgeRateValue),
+                m_colorRateOp->id(),colorRateOpacity,m_gpuSession.get())) return;
+    }
 
     if (colorRateOpacity > 0 &&
         m_useDullingMode &&

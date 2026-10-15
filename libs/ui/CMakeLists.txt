@@ -713,6 +713,10 @@ target_sources(kritaui
 )
 generate_export_header(kritaui BASE_NAME kritaui)
 
+if(WIN32)
+    target_link_libraries(kritaui PRIVATE opengl32)
+endif()
+
 target_link_libraries(kritaui
     PUBLIC
         KF${KF_MAJOR}::CoreAddons

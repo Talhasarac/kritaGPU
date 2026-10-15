@@ -1,6 +1,7 @@
 add_subdirectory( tests )
 
 add_subdirectory( tiles3 )
+add_subdirectory(gpu)
 
 include_directories(
     ${CMAKE_CURRENT_BINARY_DIR}
@@ -28,6 +29,7 @@ foreach(_obj IN LISTS __per_arch_circle_mask_generator_objs _per_arch_processor_
 endforeach()
 
 set(kritaimage_LIB_SRCS
+   gpu/KisGpuBrushPaint.cpp
    tiles3/kis_tile.cc
    tiles3/kis_tile_data.cc
    tiles3/kis_tile_data_store.cc
@@ -409,6 +411,7 @@ if(APPLE)
 endif()
 
 target_link_libraries(kritaimage PUBLIC kritamultiarch)
+target_link_libraries(kritaimage PUBLIC kritagpubrush)
 
 if (NOT GSL_FOUND)
   message (WARNING "KRITA WARNING! No GNU Scientific Library was found! Krita's Shaped Gradients might be non-normalized! Please install GSL library.")

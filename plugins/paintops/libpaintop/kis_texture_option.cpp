@@ -13,6 +13,9 @@
 #include <QFormLayout>
 #include <QPainter>
 #include <QBoxLayout>
+#include <QHash>
+#include <QMutex>
+#include <QMutexLocker>
 
 #include <klocalizedstring.h>
 
@@ -281,6 +284,73 @@ void KisTextureOption::apply(KisFixedPaintDeviceSP dab, const QPoint &offset, co
 {
     if (!m_enabled) return;
     if (!m_maskInfo->isValid()) return;
+
+    if (const auto original = dab->deferredGpuDab()) {
+        const bool supported = m_texturingMode == KisTextureOptionData::MULTIPLY ||
+            m_texturingMode == KisTextureOptionData::SUBTRACT || m_texturingMode == KisTextureOptionData::DARKEN;
+        const auto mask = m_maskInfo->mask();
+        const auto bounds = m_maskInfo->maskBounds();
+        if (supported && mask->pixelSize() == 1 && !bounds.isEmpty() &&
+            qint64(bounds.width())*bounds.height() <= 4*1024*1024) {
+            struct Pattern {
+                KisPaintDeviceSP device;
+                int sequence;
+                QRect bounds;
+                std::shared_ptr<const std::vector<std::uint32_t>> pixels;
+            };
+            static QMutex patternMutex;
+            static QHash<const KisPaintDevice *,Pattern> patterns;
+            std::shared_ptr<const std::vector<std::uint32_t>> pattern;
+            {
+                QMutexLocker lock(&patternMutex);
+                const auto cached=patterns.constFind(mask.data());
+                if (cached!=patterns.constEnd() && cached->sequence==mask->sequenceNumber() && cached->bounds==bounds) {
+                    pattern=cached->pixels;
+                } else {
+                    auto pixels=std::make_shared<std::vector<std::uint32_t>>(bounds.width()*bounds.height());
+                    QByteArray bytes(pixels->size(),Qt::Uninitialized);
+                    mask->readBytes(reinterpret_cast<quint8 *>(bytes.data()),bounds);
+                    for (int i=0;i<bytes.size();++i) (*pixels)[i]=quint8(bytes[i]);
+                    pattern=pixels;
+                    if (patterns.size()>=4) patterns.clear();
+                    patterns.insert(mask.data(),Pattern{mask,mask->sequenceNumber(),bounds,pattern});
+                }
+            }
+            const int ox = effectiveOffsetX(info)+bounds.x(), oy = effectiveOffsetY(info)+bounds.y();
+            const qreal strength = m_strengthOption.apply(info);
+            auto copy = std::make_shared<KisDeferredGpuDab>(*original);
+            copy->pattern = pattern;
+            auto &d = copy->description;
+            d.texture[1]=bounds.width(); d.texture[2]=bounds.height();
+            d.texture[3]=m_texturingMode==KisTextureOptionData::MULTIPLY ? 1 :
+                m_texturingMode==KisTextureOptionData::SUBTRACT ? 2 : 3;
+            d.textureParams[0]=ox; d.textureParams[1]=oy;
+            d.textureParams[2]=strength; d.textureParams[3]=m_useSoftTexturing ? 1 : 0;
+            const auto *alpha = dab->colorSpace()->channels()[3];
+            const QString op = m_texturingMode==KisTextureOptionData::MULTIPLY ? COMPOSITE_MULT :
+                m_texturingMode==KisTextureOptionData::SUBTRACT ? COMPOSITE_SUBTRACT : COMPOSITE_DARKEN;
+            const auto cpu = std::shared_ptr<KisMaskingBrushCompositeOpBase>(
+                KisMaskingBrushCompositeOpFactory::createForAlphaSrc(op,alpha->channelValueType(),
+                    dab->pixelSize(),alpha->pos(),strength,m_useSoftTexturing));
+            copy->generateCpu = [original,pattern,bounds,offset,ox,oy,cpu](KisFixedPaintDevice *dst) {
+                original->generateCpu(dst);
+                const auto size=dst->bounds().size();
+                QByteArray row(size.width(),Qt::Uninitialized);
+                quint8 *pixels=dst->data();
+                for (int y=0;y<size.height();++y) {
+                    const int py=((offset.y()+y-oy)%bounds.height()+bounds.height())%bounds.height();
+                    for (int x=0;x<size.width();++x) {
+                        const int px=((offset.x()+x-ox)%bounds.width()+bounds.width())%bounds.width();
+                        row[x]=char((*pattern)[py*bounds.width()+px]);
+                    }
+                    cpu->composite(reinterpret_cast<const quint8 *>(row.constData()),row.size(),
+                        pixels+y*size.width()*dst->pixelSize(),size.width()*dst->pixelSize(),size.width(),1);
+                }
+            };
+            dab->setDeferredGpuDab(std::move(copy));
+            return;
+        }
+    }
 
     if (m_texturingMode == KisTextureOptionData::LIGHTNESS) {
         applyLightness(dab, offset, info);

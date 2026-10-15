@@ -26,6 +26,12 @@
 #include "KisOpenGLModeProber.h"
 #include "KisOpenGLContextSwitchLock.h"
 #include <KisPlatformPluginInterfaceFactory.h>
+#include <gpu/KisGpuBrushCompositor.h>
+#include <kis_image_config.h>
+#include <QOpenGLExtraFunctions>
+#ifdef Q_OS_WIN
+#include <qt_windows.h>
+#endif
 
 #include "config-qt-patches-present.h"
 
@@ -77,6 +83,8 @@ public:
     KisOpenGLCanvasRenderer *renderer;
     QScopedPointer<KisOpenGLSync> glSyncObject;
     KisRepaintDebugger repaintDbg;
+    std::uint64_t gpuImageKey=0;
+    bool gpuRegistered=false;
 };
 
 KisOpenGLCanvas2::KisOpenGLCanvas2(KisCanvas2 *canvas,
@@ -97,6 +105,7 @@ KisOpenGLCanvas2::KisOpenGLCanvas2(KisCanvas2 *canvas,
     cfg.setCanvasState("OPENGL_STARTED");
 
     d->renderer = new KisOpenGLCanvasRenderer(new CanvasBridge(this), image, displayConfig, displayFilter);
+    d->gpuImageKey=reinterpret_cast<std::uintptr_t>(image.data());
 
     connect(d->renderer->openGLImageTextures().data(),
             SIGNAL(sigShowFloatingMessage(QString, int, bool)),
@@ -165,6 +174,7 @@ KisOpenGLCanvas2::KisOpenGLCanvas2(KisCanvas2 *canvas,
 
 KisOpenGLCanvas2::~KisOpenGLCanvas2()
 {
+    if (d->gpuRegistered) KisGpuBrush::Compositor::instance().unregisterCanvas(d->gpuImageKey,reinterpret_cast<std::uintptr_t>(this));
     /**
      * Since we delete openGL resources, we should make sure the
      * context is initialized properly before they are deleted.
@@ -221,6 +231,24 @@ void KisOpenGLCanvas2::initializeGL()
 {
     d->renderer->initializeGL();
     KisOpenGLSync::init(context());
+#ifdef Q_OS_WIN
+    if (KisImageConfig(true).useGpuBrushCompositing() && !context()->isOpenGLES() && wglGetCurrentContext() &&
+        !qEnvironmentVariableIsSet("KRITA_GPU_BRUSH_NO_CANVAS_SHARE")) {
+        auto &gpu=KisGpuBrush::Compositor::instance();
+        gpu.configureNativeCanvas(wglGetCurrentContext(),wglGetCurrentDC());
+        qInfo()<<"Native canvas renderer:"<<reinterpret_cast<const char *>(context()->functions()->glGetString(GL_RENDERER));
+        qInfo().noquote()<<QString::fromStdString(gpu.diagnostic());
+        if (d->renderer->openGLImageTextures()->canUseGpuBrushProjection()) {
+            gpu.registerCanvas(d->gpuImageKey,reinterpret_cast<std::uintptr_t>(this),[this] {
+                QMetaObject::invokeMethod(this,[this] {
+                    d->canvasImageDirtyRect=rect(); update();
+                },Qt::QueuedConnection);
+            });
+            d->gpuRegistered=true;
+            qInfo()<<"Native GPU brush canvas sharing:"<<gpu.canPresent(d->gpuImageKey);
+        }
+    }
+#endif
 }
 
 void KisOpenGLCanvas2::resizeGL(int width, int height)
@@ -247,6 +275,19 @@ void KisOpenGLCanvas2::paintGL()
     KisOpenglCanvasDebugger::instance()->notifyPaintRequested();
     QRect canvasImageDirtyRect = d->canvasImageDirtyRect & rect();
     d->canvasImageDirtyRect = QRect();
+    if (d->gpuRegistered && !d->renderer->openGLImageTextures()->canUseGpuBrushProjection()) {
+        KisGpuBrush::Compositor::instance().unregisterCanvas(d->gpuImageKey,reinterpret_cast<std::uintptr_t>(this));
+        d->gpuRegistered=false;
+    }
+    if (d->gpuRegistered) {
+        KisGpuBrush::Compositor::instance().present(d->gpuImageKey,[this](const auto &tiles)->void * {
+            d->renderer->openGLImageTextures()->updateFromGpuBrush(tiles);
+            auto *f=context()->extraFunctions();
+            auto fence=f->glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE,0);
+            f->glFlush();
+            return reinterpret_cast<void *>(fence);
+        });
+    }
     d->renderer->paintCanvasOnly(canvasImageDirtyRect, updateRect);
     {
         QPainter gc(this);

@@ -13,8 +13,6 @@ set(kritadefaultpaintops_SOURCES
         brush/KisDabRenderingQueueCache.cpp
         brush/KisDabRenderingJob.cpp
         brush/KisDabRenderingExecutor.cpp
-        brush/gpu/KisGpuBrushCompositor.cpp
-        brush/gpu/KisGpuBrushPaint.cpp
         duplicate/kis_duplicateop.cpp
         duplicate/kis_duplicateop_settings.cpp
         duplicate/kis_duplicateop_settings_widget.cpp
@@ -28,7 +26,7 @@ ki18n_wrap_ui(kritadefaultpaintops_SOURCES duplicate/wdgduplicateop.ui )
 kis_add_library(kritadefaultpaintops_static STATIC ${kritadefaultpaintops_SOURCES})
 generate_export_header(kritadefaultpaintops_static BASE_NAME kritadefaultpaintops EXPORT_MACRO_NAME KRITADEFAULTPAINTOPS_EXPORT)
 
-target_link_libraries(kritadefaultpaintops_static kritalibpaintop)
+target_link_libraries(kritadefaultpaintops_static kritalibpaintop kritagpubrush)
 if(WIN32)
     target_link_libraries(kritadefaultpaintops_static opengl32 gdi32 user32)
 endif()

@@ -12,6 +12,7 @@
 #include <QOpenGLFunctions>
 
 #include "kis_opengl.h"
+#include <gpu/KisGpuBrushCompositor.h>
 
 
 class KisOpenGLBufferCircularStorage;
@@ -54,6 +55,7 @@ public:
     }
 
     void update(const KisTextureTileUpdateInfo &updateInfo, bool blockMipmapRegeneration);
+    void updateFromGpuBuffer(const KisGpuBrush::PresentationTile &source, const QRect &imageBounds);
 
     inline QRect tileRectInImagePixels() {
         return m_tileRectInImagePixels;

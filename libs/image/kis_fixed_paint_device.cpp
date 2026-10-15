@@ -24,20 +24,29 @@ KisFixedPaintDevice::~KisFixedPaintDevice()
 KisFixedPaintDevice::KisFixedPaintDevice(const KisFixedPaintDevice& rhs)
         : KisShared()
 {
+    std::lock_guard<std::recursive_mutex> lock(rhs.m_gpuMutex);
     m_bounds = rhs.m_bounds;
     m_colorSpace = rhs.m_colorSpace;
     m_data = rhs.m_data;
+    m_gpuDab = rhs.m_gpuDab;
+    m_gpuMaterialized = rhs.m_gpuMaterialized;
 }
 
 KisFixedPaintDevice& KisFixedPaintDevice::operator=(const KisFixedPaintDevice& rhs)
 {
+    if (this == &rhs) return *this;
+    std::scoped_lock lock(m_gpuMutex,rhs.m_gpuMutex);
     m_bounds = rhs.m_bounds;
     m_colorSpace = rhs.m_colorSpace;
 
 
     const int referenceSize = m_bounds.height() * m_bounds.width() * pixelSize();
 
-    if (m_data.size() >= referenceSize) {
+    m_gpuDab = rhs.m_gpuDab;
+    m_gpuMaterialized = rhs.m_gpuMaterialized;
+    if (m_gpuDab && !m_gpuMaterialized) {
+        m_data.resize(0);
+    } else if (m_data.size() >= referenceSize) {
         memcpy(m_data.data(), rhs.m_data.constData(), referenceSize);
     } else {
         m_data = rhs.m_data;
@@ -48,22 +57,31 @@ KisFixedPaintDevice& KisFixedPaintDevice::operator=(const KisFixedPaintDevice& r
 
 void KisFixedPaintDevice::setRect(const QRect& rc)
 {
+    std::lock_guard<std::recursive_mutex> lock(m_gpuMutex);
+    if (rc != m_bounds) m_gpuDab.reset();
     m_bounds = rc;
 }
 
 void KisFixedPaintDevice::setColorSpace(const KoColorSpace *cs)
 {
+    std::lock_guard<std::recursive_mutex> lock(m_gpuMutex);
+    if (*m_colorSpace == *cs) { m_colorSpace=cs; return; }
+    if (m_gpuDab && *m_colorSpace != *cs) materializeGpuDab();
+    m_gpuDab.reset();
     m_colorSpace = cs;
 }
 
 QRect KisFixedPaintDevice::bounds() const
 {
+    std::lock_guard<std::recursive_mutex> lock(m_gpuMutex);
     return m_bounds;
 }
 
 
 int KisFixedPaintDevice::allocatedPixels() const
 {
+    std::lock_guard<std::recursive_mutex> lock(m_gpuMutex);
+    if (m_gpuDab && !m_gpuMaterialized) return m_bounds.width() * m_bounds.height();
     return m_data.size() / m_colorSpace->pixelSize();
 }
 
@@ -75,6 +93,7 @@ quint32 KisFixedPaintDevice::pixelSize() const
 
 bool KisFixedPaintDevice::initialize(quint8 defaultValue)
 {
+    m_gpuDab.reset();
     m_data.fill(defaultValue, m_bounds.height() * m_bounds.width() * pixelSize());
 
     return true;
@@ -82,6 +101,7 @@ bool KisFixedPaintDevice::initialize(quint8 defaultValue)
 
 void KisFixedPaintDevice::reallocateBufferWithoutInitialization()
 {
+    m_gpuDab.reset();
     const int referenceSize = m_bounds.height() * m_bounds.width() * pixelSize();
 
     if (referenceSize != m_data.size()) {
@@ -91,6 +111,7 @@ void KisFixedPaintDevice::reallocateBufferWithoutInitialization()
 
 void KisFixedPaintDevice::lazyGrowBufferWithoutInitialization()
 {
+    m_gpuDab.reset();
     const int referenceSize = m_bounds.height() * m_bounds.width() * pixelSize();
 
     if (m_data.size() < referenceSize) {
@@ -100,23 +121,56 @@ void KisFixedPaintDevice::lazyGrowBufferWithoutInitialization()
 
 quint8* KisFixedPaintDevice::data()
 {
+    std::lock_guard<std::recursive_mutex> lock(m_gpuMutex);
+    materializeGpuDab();
+    m_gpuDab.reset();
     return (quint8*) m_data.data();
 }
 
 const quint8 *KisFixedPaintDevice::constData() const
 {
+    std::lock_guard<std::recursive_mutex> lock(m_gpuMutex);
+    materializeGpuDab();
     return (const quint8*) m_data.constData();
 }
 
 quint8* KisFixedPaintDevice::data() const
 {
+    std::lock_guard<std::recursive_mutex> lock(m_gpuMutex);
+    materializeGpuDab();
+    m_gpuDab.reset();
     return const_cast<quint8*>(m_data.constData());
+}
+
+void KisFixedPaintDevice::setDeferredGpuDab(std::shared_ptr<KisDeferredGpuDab> dab)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_gpuMutex);
+    m_gpuDab = std::move(dab);
+    m_gpuMaterialized = false;
+}
+
+std::shared_ptr<const KisDeferredGpuDab> KisFixedPaintDevice::deferredGpuDab() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_gpuMutex);
+    return m_gpuDab;
+}
+
+void KisFixedPaintDevice::materializeGpuDab() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_gpuMutex);
+    if (!m_gpuDab || m_gpuMaterialized) return;
+    auto dab = m_gpuDab;
+    m_gpuDab.reset(); // permit the CPU generator to use data() recursively
+    dab->generateCpu(const_cast<KisFixedPaintDevice *>(this));
+    m_gpuDab = std::move(dab);
+    m_gpuMaterialized = true;
 }
 
 void KisFixedPaintDevice::convertTo(const KoColorSpace* dstColorSpace,
                                     KoColorConversionTransformation::Intent renderingIntent,
                                     KoColorConversionTransformation::ConversionFlags conversionFlags)
 {
+    std::lock_guard<std::recursive_mutex> lock(m_gpuMutex);
     if (*m_colorSpace == *dstColorSpace) {
         return;
     }
@@ -134,10 +188,14 @@ void KisFixedPaintDevice::convertTo(const KoColorSpace* dstColorSpace,
 
     m_colorSpace = dstColorSpace;
     m_data = dstData;
+    m_gpuDab.reset();
 }
 
 void KisFixedPaintDevice::setProfile(const KoColorProfile *profile)
 {
+    std::lock_guard<std::recursive_mutex> lock(m_gpuMutex);
+    materializeGpuDab();
+    m_gpuDab.reset();
     KIS_SAFE_ASSERT_RECOVER_RETURN(profile);
 
     const KoColorSpace *dstColorSpace =
@@ -243,6 +301,8 @@ void KisFixedPaintDevice::fill(const QRect &rc, const KoColor &color)
 
 void KisFixedPaintDevice::fill(qint32 x, qint32 y, qint32 w, qint32 h, const quint8 *fillPixel)
 {
+    materializeGpuDab();
+    m_gpuDab.reset();
     if (m_data.isEmpty() || m_bounds.isEmpty()) {
         setRect(QRect(x, y, w, h));
         reallocateBufferWithoutInitialization();
@@ -277,6 +337,7 @@ void KisFixedPaintDevice::fill(qint32 x, qint32 y, qint32 w, qint32 h, const qui
 
 void KisFixedPaintDevice::readBytes(quint8* dstData, qint32 x, qint32 y, qint32 w, qint32 h) const
 {
+    materializeGpuDab();
     if (m_data.isEmpty() || m_bounds.isEmpty()) {
         return;
     }
@@ -304,6 +365,16 @@ void KisFixedPaintDevice::readBytes(quint8* dstData, qint32 x, qint32 y, qint32 
 
 void KisFixedPaintDevice::mirror(bool horizontal, bool vertical)
 {
+    if (auto original = deferredGpuDab()) {
+        auto copy = std::make_shared<KisDeferredGpuDab>(*original);
+        copy->description.data[3] ^= (horizontal ? 1u : 0u) | (vertical ? 2u : 0u);
+        copy->generateCpu = [original,horizontal,vertical](KisFixedPaintDevice *dst) {
+            original->generateCpu(dst);
+            dst->mirror(horizontal,vertical);
+        };
+        setDeferredGpuDab(std::move(copy));
+        return;
+    }
     if (!horizontal && !vertical){
         return;
     }
