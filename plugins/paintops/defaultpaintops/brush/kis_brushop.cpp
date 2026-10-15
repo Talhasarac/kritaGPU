@@ -96,6 +96,7 @@ KisBrushOp::KisBrushOp(const KisPaintOpSettingsSP settings, KisPainter *painter,
                     painter->runnableStrokeJobsInterface(),
                     &m_mirrorOption,
                     &m_precisionOption));
+    if (m_useGpuBrushCompositing) m_gpuSession.reset(new KisGpuBrushPaint::Session);
 }
 
 KisBrushOp::~KisBrushOp()
@@ -172,8 +173,9 @@ void KisBrushOp::addDabRenderingJobs(const QVector<QRect> &rects,
 {
     if (m_useGpuBrushCompositing &&
         KisGpuBrushPaint::shouldUse(state->painter, rects, state->dabsQueue)) {
-        KritaUtils::addJobSequential(jobs, [rects, state] {
-            if (KisGpuBrushPaint::tryPaint(state->painter, rects, state->dabsQueue)) {
+        const auto session = m_gpuSession;
+        KritaUtils::addJobSequential(jobs, [rects, state, session] {
+            if (KisGpuBrushPaint::tryPaint(state->painter, rects, state->dabsQueue, session.data())) {
                 state->usedGpu = true;
             } else {
                 for (const QRect &rect : rects) state->painter->bltFixed(rect, state->dabsQueue);
@@ -242,10 +244,15 @@ std::pair<int, bool> KisBrushOp::doAsynchronousUpdate(QVector<KisRunnableStrokeJ
 
             // we limit the number of fetched dabs to fit the maximum update period and not
             // make visual hiccups
-            const int dabsLimit =
+            int dabsLimit =
                 totalRenderingTimePerDab > 0 ?
                     qMax(10, int(m_maxUpdatePeriod  / totalRenderingTimePerDab * m_idealNumRects)) :
                     -1;
+
+            if (m_useGpuBrushCompositing) {
+                const int gpuLimit = KisGpuBrushPaint::maxDabsPerUpdate(painter(), m_dabExecutor->averageDabSize());
+                if (gpuLimit > 0) dabsLimit = dabsLimit < 0 ? gpuLimit : qMin(dabsLimit, gpuLimit);
+            }
 
             state->dabsQueue = m_dabExecutor->takeReadyDabs(painter()->hasMirroring(), dabsLimit, &someDabsAreStillInQueue);
         }

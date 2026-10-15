@@ -17,9 +17,12 @@ layout(std430, binding = 1) readonly buffer Sources { uint sources[]; };
 layout(std430, binding = 2) readonly buffer Dabs { Dab dabs[]; };
 layout(std430, binding = 3) readonly buffer Indices { uint indices[]; };
 layout(std430, binding = 4) readonly buffer Selection { uint mask[]; };
+layout(std430, binding = 5) buffer Transfer { uint transfer[]; };
 uniform ivec4 tile; // world origin and dimensions
 uniform uvec4 ranges; // pixel offset, index offset, count, channel flags
+uniform uvec4 residency; // atlas pixel offset, stride, enabled, initialize
 uniform int mode;
+uniform int hasSelection;
 
 vec4 unpackPixel(uint p) {
     return vec4(p & 255u, (p >> 8) & 255u, (p >> 16) & 255u, p >> 24);
@@ -97,10 +100,19 @@ void main() {
     ivec2 local = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(local, tile.zw))) return;
     uint offset = ranges.x + uint(local.y * tile.z + local.x);
-    float selection = float(mask[offset]) * (1.0 / 255.0);
-    if (selection == 0.0) return;
+    uint destination = residency.z != 0u
+        ? residency.x + uint(local.y) * residency.y + uint(local.x) : offset;
+    uint original = residency.z != 0u && residency.w != 0u
+        ? transfer[offset] : pixels[destination];
+    float selection = hasSelection != 0 ? float(mask[offset]) * (1.0 / 255.0) : 1.0;
+    if (selection == 0.0) {
+        if (residency.z != 0u) {
+            pixels[destination] = original;
+            transfer[offset] = original;
+        }
+        return;
+    }
     ivec2 world = tile.xy + local;
-    uint original = pixels[offset];
     vec4 dst = unpackPixel(original);
     for (uint i = 0u; i < ranges.z; ++i) {
         Dab dab = dabs[indices[ranges.y + i]];
@@ -115,7 +127,8 @@ void main() {
         dst = unpackPixel(packPixel(dst));
     }
     uint result = packPixel(dst);
-    if (result != original) pixels[offset] = result;
+    if (result != original || residency.w != 0u) pixels[destination] = result;
+    if (residency.z != 0u) transfer[offset] = result;
 }
 )GLSL";
 }

@@ -6,12 +6,14 @@
 #define KIS_GPU_BRUSH_COMPOSITOR_H
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace KisGpuBrush
 {
+inline constexpr int residentTileSize = 256;
 enum class BlendMode : int { Over, AlphaDarkenCreamy, AlphaDarkenHard, Erase };
 
 // This layout is also used by the shader's std430 buffer. Pixels stay in the
@@ -33,11 +35,20 @@ struct Tile
 
 struct Batch
 {
+    // A nonzero paint-device identity enables bounded GPU tile residency.
+    // Input pixels are still authoritative: changed CPU pixels invalidate the
+    // corresponding cached region, including after undo or CPU fallback.
+    std::uint64_t cacheId = 0;
+    std::uint64_t cacheGeneration = 0;
+    // Stroke sessions can defer CPU reads until a tile is actually missing.
+    // A generation must change after any external CPU modification. The
+    // callback is synchronous and must not change the paint device.
+    std::function<void(const Tile &, std::uint32_t *)> loadPixels;
     BlendMode mode = BlendMode::Over;
     std::uint32_t channelFlags = 15;
     std::vector<std::uint32_t> pixels;
     std::vector<std::uint32_t> sourcePixels;
-    std::vector<std::uint32_t> selection; // one byte-valued uint per pixel
+    std::vector<std::uint32_t> selection; // empty = no selection mask (255)
     std::vector<Dab> dabs;
     std::vector<std::uint32_t> dabIndices;
     std::vector<Tile> tiles;
@@ -49,6 +60,11 @@ struct Result
     std::string message;
     std::string renderer;
     std::uint64_t dispatches = 0;
+    std::uint64_t uploadedBytes = 0;
+    std::uint64_t destinationUploadedBytes = 0;
+    std::uint64_t readbackBytes = 0;
+    std::uint64_t reusedTiles = 0;
+    std::uint64_t residentTiles = 0;
 };
 
 /**

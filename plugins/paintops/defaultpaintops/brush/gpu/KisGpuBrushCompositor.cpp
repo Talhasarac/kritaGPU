@@ -11,13 +11,17 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstddef>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <future>
 #include <limits>
 #include <mutex>
+#include <map>
+#include <set>
 #include <stdexcept>
 #include <thread>
+#include <tuple>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -39,7 +43,7 @@ constexpr std::size_t maxBufferBytes = 128u * 1024u * 1024u;
 bool validBatch(const Batch &b)
 {
     if (b.tiles.empty() || b.dabs.empty() || b.dabIndices.empty() || b.pixels.empty() ||
-        b.selection.size() != b.pixels.size() || b.channelFlags > 15 ||
+        (!b.selection.empty() && b.selection.size() != b.pixels.size()) || b.channelFlags > 15 ||
         int(b.mode) < 0 || int(b.mode) > 3) return false;
     if (b.mode != BlendMode::Over && b.channelFlags != 15) return false;
     if (b.pixels.size() > maxBufferBytes / 4 ||
@@ -218,10 +222,11 @@ public:
             m_gl.GetInteger64v(maxShaderStorageBlockSize, &m_maxBufferSize);
             if (m_maxBufferSize < 1024 * 1024) throw std::runtime_error("GPU storage buffers are too small");
             compile();
-            m_gl.GenBuffers(5, m_buffers);
+            m_gl.GenBuffers(6, m_buffers);
             const char *labels[] = {"Krita brush destination", "Krita brush tips",
-                                   "Krita brush dabs", "Krita tile dab indices", "Krita brush selection"};
-            for (int i = 0; i < 5; ++i) {
+                                   "Krita brush dabs", "Krita tile dab indices", "Krita brush selection",
+                                   "Krita resident paint tile atlas"};
+            for (int i = 0; i < 6; ++i) {
                 m_gl.BindBuffer(shaderStorageBuffer, m_buffers[i]);
                 m_gl.ObjectLabel(0x82E0, m_buffers[i], -1, labels[i]);
             }
@@ -237,7 +242,7 @@ public:
     ~GlWorker()
     {
         if (m_context) {
-            if (m_gl.DeleteBuffers) m_gl.DeleteBuffers(5, m_buffers);
+            if (m_gl.DeleteBuffers) m_gl.DeleteBuffers(6, m_buffers);
             if (m_program && m_gl.DeleteProgram) m_gl.DeleteProgram(m_program);
             wglMakeCurrent(nullptr, nullptr);
             wglDeleteContext(m_context);
@@ -255,21 +260,61 @@ public:
         bool debugGroup = false;
         try {
             while (glGetError() != GL_NO_ERROR) {}
+            std::vector<std::uint32_t> output(batch.pixels.size());
             m_gl.PushDebugGroup(0x824A, 0, -1, "Krita GPU Pixel Brush batch");
             debugGroup = true;
-            upload(0, batch.pixels);
-            upload(1, batch.sourcePixels);
-            upload(2, batch.dabs);
-            upload(3, batch.dabIndices);
-            upload(4, batch.selection);
+            const bool resident = prepareResidentTiles(batch, result);
+            if (resident) {
+                // This buffer is a compact dirty-pixel transfer surface. It
+                // receives CPU data only for cache misses; the compositor
+                // reads the previous paint result directly from the atlas.
+                reserve(0, batch.pixels.size() * 4);
+                for (std::size_t i = 0; i < batch.tiles.size(); ++i) {
+                    if (m_prepared[i].reused) ++result.reusedTiles;
+                    if (!m_prepared[i].initialize) continue;
+                    const Tile &t = batch.tiles[i];
+                    if (batch.loadPixels) batch.loadPixels(t, output.data() + t.pixelOffset);
+                    const auto bytes = std::size_t(t.width) * t.height * 4;
+                    m_gl.BufferSubData(shaderStorageBuffer, std::ptrdiff_t(t.pixelOffset) * 4,
+                                       std::ptrdiff_t(bytes),
+                                       (batch.loadPixels ? output.data() : batch.pixels.data()) + t.pixelOffset);
+                    result.destinationUploadedBytes += bytes;
+                }
+                result.residentTiles = batch.tiles.size();
+                result.uploadedBytes += result.destinationUploadedBytes;
+                m_gl.BindBufferBase(shaderStorageBuffer, 0, m_buffers[5]);
+                m_gl.BindBufferBase(shaderStorageBuffer, 5, m_buffers[0]);
+            } else {
+                if (batch.loadPixels) {
+                    for (const Tile &t : batch.tiles) batch.loadPixels(t, output.data() + t.pixelOffset);
+                }
+                upload(0, batch.loadPixels ? output : batch.pixels, false, result);
+                result.destinationUploadedBytes = batch.pixels.size() * 4;
+                m_gl.BindBufferBase(shaderStorageBuffer, 5, m_buffers[0]);
+            }
+            upload(1, batch.sourcePixels, resident, result);
+            upload(2, batch.dabs, resident, result);
+            upload(3, batch.dabIndices, resident, result);
+            // An absent selection is an implicit 255 mask, avoiding an entire
+            // mask allocation, fill and transfer on ordinary brush strokes.
+            static const std::vector<std::uint32_t> noSelection {255};
+            upload(4, batch.selection.empty() ? noSelection : batch.selection, resident, result);
             checkError("uploading brush buffers");
             m_gl.UseProgram(m_program);
             m_gl.Uniform1i(m_modeLocation, int(batch.mode));
-            for (const Tile &t : batch.tiles) {
+            m_gl.Uniform1i(m_selectionLocation, batch.selection.empty() ? 0 : 1);
+            for (std::size_t i = 0; i < batch.tiles.size(); ++i) {
+                const Tile &t = batch.tiles[i];
                 m_gl.Uniform4i(m_tileLocation, t.x, t.y, t.width, t.height);
                 // Keep individual dispatches bounded to avoid a very dense
                 // brush batch monopolizing the Windows GPU scheduler.
                 for (unsigned first = 0; first < t.dabCount; first += 256) {
+                    if (resident) {
+                        m_gl.Uniform4ui(m_residencyLocation, m_prepared[i].offset,
+                                        residentTileSize, 1, first == 0 && m_prepared[i].initialize ? 1 : 0);
+                    } else {
+                        m_gl.Uniform4ui(m_residencyLocation, 0, 0, 0, 0);
+                    }
                     const unsigned count = std::min(256u, t.dabCount - first);
                     m_gl.Uniform4ui(m_rangesLocation, t.pixelOffset, t.indexOffset + first,
                                     count, batch.channelFlags);
@@ -294,13 +339,14 @@ public:
             } while (std::chrono::steady_clock::now() < deadline);
             m_gl.DeleteSync(fence);
             if (!completed) throw std::runtime_error("GPU brush fence failed or timed out");
-            std::vector<std::uint32_t> output(batch.pixels.size());
             m_gl.BindBuffer(shaderStorageBuffer, m_buffers[0]);
             m_gl.GetBufferSubData(shaderStorageBuffer, 0,
                                  std::ptrdiff_t(output.size() * 4), output.data());
             checkError("reading brush result");
             // Commit only a complete result. A failed dispatch never modifies
             // the CPU device or the caller's input pixels.
+            result.readbackBytes = batch.pixels.size() * 4;
+            if (resident) rememberResidentPixels(batch, output);
             batch.pixels.swap(output);
             result.success = true;
         } catch (const std::exception &e) {
@@ -313,6 +359,135 @@ public:
     }
 
 private:
+    static constexpr unsigned maxResidentTiles = 256;
+    static constexpr std::size_t cellPixels = residentTileSize * residentTileSize;
+    using CacheKey = std::tuple<std::uint64_t, std::uint64_t, std::int32_t, std::int32_t>;
+    struct ResidentTile {
+        unsigned slot = 0;
+        std::uint64_t age = 0;
+        std::uint64_t loadedAge = 0;
+        bool fullyLoaded = false;
+        std::vector<std::uint32_t> shadow;
+        std::vector<unsigned char> valid;
+    };
+    struct PreparedTile {
+        ResidentTile *entry = nullptr;
+        std::uint32_t offset = 0;
+        bool initialize = true;
+        bool reused = false;
+    };
+    static std::int32_t cellOrigin(std::int32_t v)
+    {
+        return std::int32_t((std::int64_t(v) - (v < 0 ? residentTileSize - 1 : 0)) /
+                            residentTileSize * residentTileSize);
+    }
+    bool prepareResidentTiles(const Batch &batch, Result &result)
+    {
+        m_prepared.clear();
+        if (!batch.cacheId || batch.tiles.size() > 1024) return false;
+        std::set<CacheKey> keys;
+        for (const Tile &t : batch.tiles) {
+            const auto x = cellOrigin(t.x), y = cellOrigin(t.y);
+            if (std::int64_t(t.x) + t.width > std::int64_t(x) + residentTileSize ||
+                std::int64_t(t.y) + t.height > std::int64_t(y) + residentTileSize) return false;
+            keys.emplace(batch.cacheId, batch.cacheGeneration, x, y);
+        }
+        if (keys.size() > maxResidentTiles) return false;
+        // Reject intersecting world-space output too. Packed-buffer validation
+        // alone cannot protect an atlas from two dispatches sharing pixels.
+        for (std::size_t i = 0; i < batch.tiles.size(); ++i) {
+            const auto &a = batch.tiles[i];
+            for (std::size_t j = i + 1; j < batch.tiles.size(); ++j) {
+                const auto &b = batch.tiles[j];
+                if (std::int64_t(a.x) < std::int64_t(b.x) + b.width &&
+                    std::int64_t(b.x) < std::int64_t(a.x) + a.width &&
+                    std::int64_t(a.y) < std::int64_t(b.y) + b.height &&
+                    std::int64_t(b.y) < std::int64_t(a.y) + a.height) return false;
+            }
+        }
+        if (!m_capacity[5]) reserve(5, maxResidentTiles * cellPixels * 4);
+        ++m_cacheAge;
+        // Pin all entries needed by this batch before evicting any old entry.
+        for (const auto &key : keys) {
+            const auto it = m_resident.find(key);
+            if (it != m_resident.end()) it->second.age = m_cacheAge;
+        }
+        for (const auto &key : keys) {
+            if (m_resident.count(key)) continue;
+            unsigned slot = unsigned(m_resident.size());
+            if (m_resident.size() == maxResidentTiles) {
+                auto oldest = m_resident.end();
+                for (auto it = m_resident.begin(); it != m_resident.end(); ++it) {
+                    if (it->second.age != m_cacheAge &&
+                        (oldest == m_resident.end() || it->second.age < oldest->second.age)) oldest = it;
+                }
+                if (oldest == m_resident.end()) return false;
+                slot = oldest->second.slot;
+                m_resident.erase(oldest);
+            }
+            ResidentTile entry;
+            entry.slot = slot;
+            entry.age = m_cacheAge;
+            if (!batch.loadPixels) entry.shadow.resize(cellPixels);
+            entry.valid.resize(cellPixels, 0);
+            m_resident.emplace(key, std::move(entry));
+        }
+        // A stroke owns complete cells. Initialize each cell once, including
+        // its currently clean margins, so a moving brush can enter those
+        // margins without fetching the destination from the CPU again.
+        if (batch.loadPixels) {
+            std::vector<std::uint32_t> initial;
+            for (const auto &key : keys) {
+                auto &entry = m_resident.at(key);
+                if (entry.fullyLoaded) continue;
+                initial.resize(cellPixels);
+                Tile cell;
+                cell.x = std::get<2>(key); cell.y = std::get<3>(key);
+                cell.width = cell.height = residentTileSize;
+                batch.loadPixels(cell, initial.data());
+                m_gl.BindBuffer(shaderStorageBuffer, m_buffers[5]);
+                m_gl.BufferSubData(shaderStorageBuffer, std::ptrdiff_t(entry.slot * cellPixels * 4),
+                                   std::ptrdiff_t(cellPixels * 4), initial.data());
+                result.destinationUploadedBytes += cellPixels * 4;
+                entry.fullyLoaded = true;
+                entry.loadedAge = m_cacheAge;
+                std::fill(entry.valid.begin(), entry.valid.end(), 1);
+            }
+        }
+        for (const Tile &t : batch.tiles) {
+            const auto x = cellOrigin(t.x), y = cellOrigin(t.y);
+            auto &entry = m_resident.at(CacheKey(batch.cacheId, batch.cacheGeneration, x, y));
+            const auto local = std::uint32_t((t.y - y) * residentTileSize + t.x - x);
+            bool unchanged = true;
+            for (int row = 0; !batch.loadPixels && row < t.height && unchanged; ++row) {
+                const auto pos = local + row * residentTileSize;
+                unchanged = std::all_of(entry.valid.begin() + pos, entry.valid.begin() + pos + t.width,
+                                        [](unsigned char valid) { return valid != 0; });
+                unchanged = unchanged && entry.shadow.size() == cellPixels &&
+                    std::memcmp(entry.shadow.data() + pos,
+                                batch.pixels.data() + t.pixelOffset + row * t.width, t.width * 4) == 0;
+            }
+            m_prepared.push_back({&entry, std::uint32_t(entry.slot * cellPixels + local), !unchanged,
+                                  unchanged && (!batch.loadPixels || entry.loadedAge != m_cacheAge)});
+        }
+        return true;
+    }
+    void rememberResidentPixels(const Batch &batch, const std::vector<std::uint32_t> &output)
+    {
+        if (batch.loadPixels) return;
+        for (std::size_t i = 0; i < batch.tiles.size(); ++i) {
+            const auto &t = batch.tiles[i];
+            auto &entry = *m_prepared[i].entry;
+            if (entry.shadow.empty()) entry.shadow.resize(cellPixels);
+            const auto local = m_prepared[i].offset - entry.slot * cellPixels;
+            for (int row = 0; row < t.height; ++row) {
+                const auto pos = local + row * residentTileSize;
+                std::memcpy(entry.shadow.data() + pos,
+                            output.data() + t.pixelOffset + row * t.width, t.width * 4);
+                std::fill_n(entry.valid.begin() + pos, t.width, 1);
+            }
+        }
+    }
     void checkError(const char *operation)
     {
         const GLenum error = glGetError();
@@ -350,22 +525,39 @@ private:
         m_modeLocation = m_gl.GetUniformLocation(m_program, "mode");
         m_tileLocation = m_gl.GetUniformLocation(m_program, "tile");
         m_rangesLocation = m_gl.GetUniformLocation(m_program, "ranges");
-        if (m_modeLocation < 0 || m_tileLocation < 0 || m_rangesLocation < 0) {
+        m_residencyLocation = m_gl.GetUniformLocation(m_program, "residency");
+        m_selectionLocation = m_gl.GetUniformLocation(m_program, "hasSelection");
+        if (m_modeLocation < 0 || m_tileLocation < 0 || m_rangesLocation < 0 ||
+            m_residencyLocation < 0 || m_selectionLocation < 0) {
             throw std::runtime_error("GPU brush shader uniforms are missing");
         }
     }
-    template<class T> void upload(unsigned binding, const std::vector<T> &data)
+    void reserve(unsigned binding, std::size_t bytes)
     {
-        const std::size_t bytes = data.size() * sizeof(T);
         if (!bytes || bytes > std::size_t(m_maxBufferSize)) {
             throw std::runtime_error("GPU brush batch exceeds the device buffer limit");
         }
         m_gl.BindBuffer(shaderStorageBuffer, m_buffers[binding]);
         if (bytes > m_capacity[binding]) {
-            m_gl.BufferData(shaderStorageBuffer, std::ptrdiff_t(bytes), data.data(), dynamicDraw);
+            m_gl.BufferData(shaderStorageBuffer, std::ptrdiff_t(bytes), nullptr, dynamicDraw);
             m_capacity[binding] = bytes;
-        } else {
+        }
+    }
+    template<class T> void upload(unsigned binding, const std::vector<T> &data,
+                                  bool cached, Result &result)
+    {
+        const std::size_t bytes = data.size() * sizeof(T);
+        reserve(binding, bytes);
+        auto &shadow = m_uploadShadow[binding];
+        if (!cached || shadow.size() != bytes || std::memcmp(shadow.data(), data.data(), bytes)) {
             m_gl.BufferSubData(shaderStorageBuffer, 0, std::ptrdiff_t(bytes), data.data());
+            result.uploadedBytes += bytes;
+            // Bound the additional host cache; large changing brush tips do
+            // not need another persistent copy just to discover a cache miss.
+            if (cached && bytes <= 16u * 1024u * 1024u) {
+                shadow.resize(bytes);
+                std::memcpy(shadow.data(), data.data(), bytes);
+            } else shadow.clear();
         }
         m_gl.BindBufferBase(shaderStorageBuffer, binding, m_buffers[binding]);
     }
@@ -374,10 +566,15 @@ private:
     HDC m_dc = nullptr;
     HGLRC m_context = nullptr;
     GlFunctions m_gl;
-    GLuint m_program = 0, m_buffers[5] = {};
-    std::size_t m_capacity[5] = {};
+    GLuint m_program = 0, m_buffers[6] = {};
+    std::size_t m_capacity[6] = {};
+    std::vector<unsigned char> m_uploadShadow[5];
+    std::map<CacheKey, ResidentTile> m_resident;
+    std::vector<PreparedTile> m_prepared;
+    std::uint64_t m_cacheAge = 0;
     std::int64_t m_maxBufferSize = 0;
     GLint m_modeLocation = -1, m_tileLocation = -1, m_rangesLocation = -1;
+    GLint m_residencyLocation = -1, m_selectionLocation = -1;
 };
 #else
 class GlWorker

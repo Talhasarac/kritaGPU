@@ -34,14 +34,13 @@ namespace
 {
 constexpr std::size_t maxPixels = 32u * 1024u * 1024u;
 
-bool supported(KisPainter *painter, const QList<KisRenderedDab> &dabs)
+bool supportedPainter(KisPainter *painter)
 {
 #ifndef Q_OS_WIN
     Q_UNUSED(painter);
-    Q_UNUSED(dabs);
     return false;
 #else
-    if (!painter || !painter->device() || dabs.isEmpty() ||
+    if (!painter || !painter->device() ||
         painter->device()->defaultBounds()->wrapAroundMode()) return false;
     const KoColorSpace *cs = painter->device()->colorSpace();
     if (cs->colorModelId() != RGBAColorModelID ||
@@ -51,17 +50,37 @@ bool supported(KisPainter *painter, const QList<KisRenderedDab> &dabs)
     if (op != COMPOSITE_OVER && op != COMPOSITE_ALPHA_DARKEN && op != COMPOSITE_ERASE) return false;
     if (!painter->channelFlags().isEmpty() && op != COMPOSITE_OVER) return false;
     if (!painter->channelFlags().isEmpty() && painter->channelFlags().size() != 4) return false;
-    for (const auto &dab : dabs) {
-        if (!dab.device || *dab.device->colorSpace() != *cs) return false;
-    }
     return true;
 #endif
 }
 
+bool supported(KisPainter *painter, const QList<KisRenderedDab> &dabs)
+{
+    if (!supportedPainter(painter) || dabs.isEmpty()) return false;
+    for (const auto &dab : dabs) {
+        if (!dab.device || *dab.device->colorSpace() != *painter->device()->colorSpace()) return false;
+    }
+    return true;
+}
+
 bool buildBatch(KisPainter *painter, const QVector<QRect> &rects,
-                const QList<KisRenderedDab> &dabs, KisGpuBrush::Batch &batch)
+                const QList<KisRenderedDab> &dabs, KisGpuBrush::Batch &batch, Session *session)
 {
     using namespace KisGpuBrush;
+    if (!qEnvironmentVariableIsSet("KRITA_GPU_BRUSH_NO_RESIDENCY")) {
+        if (session) {
+            session->prepare(painter->device().data());
+            batch.cacheId = session->id();
+            batch.cacheGeneration = session->generation();
+            const KisPaintDeviceSP device = painter->device();
+            batch.loadPixels = [device](const Tile &tile, std::uint32_t *pixels) {
+                device->readBytes(reinterpret_cast<quint8 *>(pixels),
+                                  QRect(tile.x, tile.y, tile.width, tile.height));
+            };
+        } else {
+            batch.cacheId = std::uint64_t(reinterpret_cast<std::uintptr_t>(painter->device().data()));
+        }
+    }
     const QString op = painter->compositeOpId();
     batch.mode = op == COMPOSITE_OVER ? BlendMode::Over :
         op == COMPOSITE_ERASE ? BlendMode::Erase :
@@ -99,21 +118,24 @@ bool buildBatch(KisPainter *painter, const QVector<QRect> &rects,
     }
     const KisSelectionSP selection = painter->selection();
     // The CPU scheduler splits dense work into small parallel patches. Merge
-    // adjacent patches again for the GPU, preserving their exact union, so a
-    // 512px area can use one dispatch instead of sixteen 128px dispatches.
+    // adjacent patches again for the GPU, preserving their exact union, before
+    // splitting at the stable resident-cell boundaries.
     QRegion updateRegion;
     for (const QRect &rect : rects) updateRegion += rect;
     for (QRect rect : updateRegion) {
         rect &= allDabs;
         if (selection) rect &= selection->selectedRect();
         if (rect.isEmpty()) continue;
-        // Use int64 loop bounds because QRect can extend to negative canvas
-        // coordinates and its inclusive right/bottom can be INT_MAX.
-        for (std::int64_t y = rect.y(); y < std::int64_t(rect.y()) + rect.height(); y += 512) {
-            for (std::int64_t x = rect.x(); x < std::int64_t(rect.x()) + rect.width(); x += 512) {
-                const QRect tileRect(int(x), int(y),
-                    int(std::min<std::int64_t>(512, std::int64_t(rect.x()) + rect.width() - x)),
-                    int(std::min<std::int64_t>(512, std::int64_t(rect.y()) + rect.height() - y)));
+        // Stable world-aligned cells survive moving update rectangles. Only
+        // the dirty intersection is read back and written to the CPU device.
+        // Cells are initialized in full only on cache misses. Use int64 bounds
+        // because canvas coordinates can be negative or reach INT_MAX.
+        const auto cellOrigin = [](int v) -> std::int64_t {
+            return (std::int64_t(v) - (v < 0 ? residentTileSize - 1 : 0)) / residentTileSize * residentTileSize;
+        };
+        for (std::int64_t y = cellOrigin(rect.y()); y < std::int64_t(rect.y()) + rect.height(); y += residentTileSize) {
+            for (std::int64_t x = cellOrigin(rect.x()); x < std::int64_t(rect.x()) + rect.width(); x += residentTileSize) {
+                const QRect tileRect = QRect(int(x), int(y), residentTileSize, residentTileSize) & rect;
                 Tile tile;
                 tile.x = tileRect.x(); tile.y = tileRect.y();
                 tile.width = tileRect.width(); tile.height = tileRect.height();
@@ -128,10 +150,12 @@ bool buildBatch(KisPainter *painter, const QVector<QRect> &rects,
                 if (batch.pixels.size() + count > maxPixels) return false;
                 tile.pixelOffset = std::uint32_t(batch.pixels.size());
                 batch.pixels.resize(batch.pixels.size() + count);
-                painter->device()->readBytes(reinterpret_cast<quint8 *>(batch.pixels.data() + tile.pixelOffset), tileRect);
-                const auto oldSize = batch.selection.size();
-                batch.selection.resize(oldSize + count, 255);
+                if (!batch.loadPixels) {
+                    painter->device()->readBytes(reinterpret_cast<quint8 *>(batch.pixels.data() + tile.pixelOffset), tileRect);
+                }
                 if (selection) {
+                    const auto oldSize = batch.selection.size();
+                    batch.selection.resize(oldSize + count);
                     std::vector<quint8> mask(count);
                     selection->projection()->readBytes(mask.data(), tileRect);
                     std::copy(mask.begin(), mask.end(), batch.selection.begin() + oldSize);
@@ -142,6 +166,33 @@ bool buildBatch(KisPainter *painter, const QVector<QRect> &rects,
     }
     return true;
 }
+}
+
+Session::Session()
+    : m_id([] { static std::atomic<std::uint64_t> next {1}; return next.fetch_add(1); }())
+{
+}
+
+void Session::prepare(KisPaintDevice *device)
+{
+    if (m_device != device || m_sequence != device->sequenceNumber() ||
+        m_lod != device->defaultBounds()->currentLevelOfDetail() ||
+        m_time != device->defaultBounds()->currentTime()) ++m_generation;
+}
+
+void Session::committed(KisPaintDevice *device)
+{
+    m_device = device;
+    m_sequence = device->sequenceNumber();
+    m_lod = device->defaultBounds()->currentLevelOfDetail();
+    m_time = device->defaultBounds()->currentTime();
+}
+
+int maxDabsPerUpdate(KisPainter *painter, int averageDiameter)
+{
+    if (!supportedPainter(painter)) return -1;
+    const auto diameter = std::uint64_t(std::max(1, averageDiameter));
+    return int(std::clamp<std::uint64_t>((8u * 1024u * 1024u) / (diameter * diameter), 4, 256));
 }
 
 bool shouldUse(KisPainter *painter, const QVector<QRect> &rects, const QList<KisRenderedDab> &dabs)
@@ -193,13 +244,14 @@ bool shouldUse(KisPainter *painter, const QVector<QRect> &rects, const QList<Kis
     return available;
 }
 
-bool tryPaint(KisPainter *painter, const QVector<QRect> &rects, const QList<KisRenderedDab> &dabs)
+bool tryPaint(KisPainter *painter, const QVector<QRect> &rects, const QList<KisRenderedDab> &dabs,
+              Session *session)
 {
     if (!supported(painter, dabs)) return false;
     KisGpuBrush::Batch batch;
     KisGpuBrush::Result result;
     try {
-        if (!buildBatch(painter, rects, dabs, batch)) return false;
+        if (!buildBatch(painter, rects, dabs, batch, session)) return false;
         if (batch.tiles.empty()) return true;
         result = KisGpuBrush::Compositor::instance().render(batch);
         if (!result.success) {
@@ -216,8 +268,16 @@ bool tryPaint(KisPainter *painter, const QVector<QRect> &rects, const QList<KisR
         painter->device()->writeBytes(reinterpret_cast<const quint8 *>(batch.pixels.data() + tile.pixelOffset),
                                      QRect(tile.x, tile.y, tile.width, tile.height));
     }
+    if (session) {
+        if (batch.loadPixels) session->committed(painter->device().data());
+        else session->invalidate();
+    }
     if (qEnvironmentVariableIsSet("KRITA_GPU_BRUSH_LOG")) {
-        qInfo() << "GPU brush batch:" << dabs.size() << "dabs," << result.dispatches << "compute dispatches";
+        qInfo() << "GPU brush batch:" << dabs.size() << "dabs," << result.dispatches << "compute dispatches,"
+                << result.reusedTiles << "/" << result.residentTiles << "resident tile hits,"
+                << result.destinationUploadedBytes << "destination bytes uploaded,"
+                << result.uploadedBytes << "total bytes uploaded,"
+                << result.readbackBytes << "bytes read back";
     }
     return true;
 }

@@ -18,6 +18,7 @@
 #include <QElapsedTimer>
 #include <cmath>
 #include <random>
+#include <algorithm>
 
 namespace
 {
@@ -187,20 +188,71 @@ void KisGpuBrushPaintTest::testLargeBatchTiming()
     const QRect bounds(0, 0, 512, 512);
     KisPaintDeviceSP cpuDevice = new KisPaintDevice(cs), gpuDevice = new KisPaintDevice(cs);
     KisPainter cpu(cpuDevice), gpu(gpuDevice);
+    KisGpuBrushPaint::Session session;
     QVERIFY(KisGpuBrushPaint::shouldUse(&gpu, {bounds}, dabs));
     // Warm the driver and the paint-device allocation before measuring.
-    QVERIFY(KisGpuBrushPaint::tryPaint(&gpu, {bounds}, dabs));
+    QVERIFY(KisGpuBrushPaint::tryPaint(&gpu, {bounds}, dabs, &session));
     cpu.bltFixed(bounds, dabs);
     QElapsedTimer timer;
     timer.start();
     for (int i = 0; i < 5; ++i) cpu.bltFixed(bounds, dabs);
     const qint64 cpuTime = timer.nsecsElapsed();
     timer.restart();
-    for (int i = 0; i < 5; ++i) QVERIFY(KisGpuBrushPaint::tryPaint(&gpu, {bounds}, dabs));
+    for (int i = 0; i < 5; ++i) QVERIFY(KisGpuBrushPaint::tryPaint(&gpu, {bounds}, dabs, &session));
     const qint64 gpuTime = timer.nsecsElapsed();
     qInfo() << "128 overlapping 512px dabs, average batch ms: KisPainter"
             << cpuTime / 5000000.0 << "; GPU including packing/transfers/writeback"
             << gpuTime / 5000000.0;
+
+    const bool hadOverride = qEnvironmentVariableIsSet("KRITA_GPU_BRUSH_NO_RESIDENCY");
+    const QByteArray oldOverride = qgetenv("KRITA_GPU_BRUSH_NO_RESIDENCY");
+    const bool hadLogging = qEnvironmentVariableIsSet("KRITA_GPU_BRUSH_LOG");
+    const QByteArray oldLogging = qgetenv("KRITA_GPU_BRUSH_LOG");
+    qunsetenv("KRITA_GPU_BRUSH_LOG");
+    for (int count : {16, 32, 128}) {
+        const auto subset = dabs.mid(0, count);
+        std::vector<double> samples[3];
+        // Alternate the order to reduce warm-up and clock drift bias. Every
+        // timed update includes packing, GPU synchronization and CPU writeback.
+        for (int round = 0; round < 5; ++round) {
+            QByteArray outputs[2];
+            for (int order = 0; order < 2; ++order) {
+                const int kind = (order + round) % 2;
+                if (kind == 0) qputenv("KRITA_GPU_BRUSH_NO_RESIDENCY", "1");
+                else qunsetenv("KRITA_GPU_BRUSH_NO_RESIDENCY");
+                KisPaintDeviceSP device = new KisPaintDevice(cs);
+                KisPainter painter(device);
+                KisGpuBrushPaint::Session stroke;
+                for (int warm = 0; warm < 2; ++warm) {
+                    QVERIFY(KisGpuBrushPaint::tryPaint(&painter, {bounds}, subset, &stroke));
+                }
+                timer.restart();
+                for (int update = 0; update < 12; ++update) {
+                    QVERIFY(KisGpuBrushPaint::tryPaint(&painter, {bounds}, subset, &stroke));
+                }
+                samples[kind].push_back(timer.nsecsElapsed() / 12000000.0);
+                outputs[kind].resize(512 * 512 * 4);
+                device->readBytes(reinterpret_cast<quint8 *>(outputs[kind].data()), bounds);
+            }
+            // Both GPU paths must render the same sequence before their
+            // timings can be meaningfully compared.
+            QCOMPARE(outputs[1], outputs[0]);
+            KisPaintDeviceSP device = new KisPaintDevice(cs);
+            KisPainter painter(device);
+            for (int warm = 0; warm < 2; ++warm) painter.bltFixed(bounds, subset);
+            timer.restart();
+            for (int update = 0; update < 12; ++update) painter.bltFixed(bounds, subset);
+            samples[2].push_back(timer.nsecsElapsed() / 12000000.0);
+        }
+        for (auto &s : samples) std::sort(s.begin(), s.end());
+        qInfo() << "RESIDENCY BENCHMARK:" << count << "overlapping 512px dabs/update; median ms/update over 5 x 12 updates:"
+                << "CPU single painter" << samples[2][2]
+                << "GPU upload each update" << samples[0][2]
+                << "GPU resident stroke" << samples[1][2];
+    }
+    if (hadOverride) qputenv("KRITA_GPU_BRUSH_NO_RESIDENCY", oldOverride);
+    else qunsetenv("KRITA_GPU_BRUSH_NO_RESIDENCY");
+    if (hadLogging) qputenv("KRITA_GPU_BRUSH_LOG", oldLogging);
 }
 
 SIMPLE_TEST_MAIN(KisGpuBrushPaintTest)

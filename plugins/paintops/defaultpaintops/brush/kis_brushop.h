@@ -29,6 +29,7 @@ class KisColorSource;
 class KisDabRenderingExecutor;
 struct KisRenderedDab;
 class KisRunnableStrokeJobData;
+namespace KisGpuBrushPaint { class Session; }
 
 class KisBrushOp : public KisBrushBasedPaintOp
 {
@@ -82,6 +83,7 @@ private:
     KisPaintDeviceSP m_lineCacheDevice;
 
     QScopedPointer<KisDabRenderingExecutor> m_dabExecutor;
+    QSharedPointer<KisGpuBrushPaint::Session> m_gpuSession;
     qreal m_currentUpdatePeriod = 20.0;
     KisRollingMeanAccumulatorWrapper m_avgSpacing;
     KisRollingMeanAccumulatorWrapper m_avgNumDabs;
